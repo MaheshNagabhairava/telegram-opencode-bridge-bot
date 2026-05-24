@@ -56,7 +56,7 @@ OPENCODE_MODEL=anthropic/claude-sonnet-4
 In a separate terminal:
 
 ```bash
-opencode serve
+opencode serve --port 4444 --hostname 127.0.0.1
 ```
 
 This starts the OpenCode HTTP API on `localhost:4096`.
@@ -80,11 +80,13 @@ Open Telegram, find your bot, and start coding! 🎉
 | `/new` | Start a fresh conversation |
 | `/sessions` | List your recent sessions |
 | `/switch <id>` | Switch to a different session |
-| `/model <name>` | Change AI model |
+| `/model <name>` | Change AI model(ex: /model opencode/deepseek-v4-flash-free) |
 | `/mode <plan\|build>` | Toggle plan/build mode |
 | `/share` | Share current session (public URL) |
-| `/status` | Bot & connection status |
+| `/status` | Check connection & session details |
 | `/id` | Show your Telegram user ID |
+| `/stop` | Abort active model processing |
+| `/models` | List all available models |
 
 ## 🏗️ Architecture
 
@@ -148,12 +150,3 @@ telegram-opencode-bot/
 └── README.md               # This file
 ```
 
-## 🤝 Inspired By
-
-- [OpenClaw](https://openclaw.ai) — autonomous AI agent with Telegram integration
-- [Hermes Agent](https://github.com/NousResearch/hermes-agent) — self-improving AI agent with multi-platform gateway
-- [OpenCode](https://opencode.ai) — terminal-native AI coding agent
-
-## 📄 License
-
-MIT
