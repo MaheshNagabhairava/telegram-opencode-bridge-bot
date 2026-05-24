@@ -28,9 +28,18 @@ class SessionManager:
                 message_count INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL,
                 last_active TEXT NOT NULL,
-                is_active INTEGER DEFAULT 1
+                is_active INTEGER DEFAULT 1,
+                name TEXT DEFAULT ''
             )
         """)
+        
+        # Safely migrate existing databases to add the 'name' column if missing
+        try:
+            await self._db.execute("ALTER TABLE sessions ADD COLUMN name TEXT DEFAULT ''")
+        except aiosqlite.OperationalError:
+            # Column already exists
+            pass
+            
         await self._db.execute("""  
             CREATE INDEX IF NOT EXISTS idx_user_active 
             ON sessions(user_id, is_active)
@@ -39,7 +48,7 @@ class SessionManager:
         
         # Load active sessions into memory
         async with self._db.execute(
-            "SELECT user_id, opencode_session_id, model, mode, message_count, created_at, last_active "
+            "SELECT user_id, opencode_session_id, model, mode, message_count, created_at, last_active, name "
             "FROM sessions WHERE is_active = 1"
         ) as cursor:
             async for row in cursor:
@@ -50,6 +59,7 @@ class SessionManager:
                     "message_count": row[4],
                     "created_at": row[5],
                     "last_active": row[6],
+                    "name": row[7] if len(row) > 7 else "",
                 }
         
         logger.info(f"Session manager initialized. {len(self._active_sessions)} active sessions loaded.")
@@ -78,8 +88,8 @@ class SessionManager:
         
         # Insert new active session
         await self._db.execute(
-            "INSERT INTO sessions (user_id, opencode_session_id, model, created_at, last_active) VALUES (?, ?, ?, ?, ?)",
-            (user_id, opencode_session_id, model, now, now)
+            "INSERT INTO sessions (user_id, opencode_session_id, model, created_at, last_active, name) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, opencode_session_id, model, now, now, "")
         )
         await self._db.commit()
         
@@ -91,21 +101,38 @@ class SessionManager:
             "message_count": 0,
             "created_at": now,
             "last_active": now,
+            "name": "",
         }
         
         logger.info(f"New session for user {user_id}: {opencode_session_id}")
     
-    async def increment_message_count(self, user_id: int) -> None:
-        """Increment the message count for a user's active session."""
+    async def increment_message_count(self, user_id: int, prompt: Optional[str] = None) -> None:
+        """Increment the message count for a user's active session and optionally set name."""
         if user_id in self._active_sessions:
             self._active_sessions[user_id]["message_count"] += 1
             now = datetime.utcnow().isoformat()
             self._active_sessions[user_id]["last_active"] = now
-            await self._db.execute(
-                "UPDATE sessions SET message_count = message_count + 1, last_active = ? "
-                "WHERE user_id = ? AND is_active = 1",
-                (now, user_id)
-            )
+            
+            name_to_set = None
+            if prompt and (not self._active_sessions[user_id].get("name") or self._active_sessions[user_id]["message_count"] == 1):
+                # Clean up prompt for a nice title (strip newlines/spaces)
+                clean_prompt = " ".join(prompt.split())
+                short_name = clean_prompt[:35] + "..." if len(clean_prompt) > 35 else clean_prompt
+                self._active_sessions[user_id]["name"] = short_name
+                name_to_set = short_name
+            
+            if name_to_set:
+                await self._db.execute(
+                    "UPDATE sessions SET message_count = message_count + 1, last_active = ?, name = ? "
+                    "WHERE user_id = ? AND is_active = 1",
+                    (now, name_to_set, user_id)
+                )
+            else:
+                await self._db.execute(
+                    "UPDATE sessions SET message_count = message_count + 1, last_active = ? "
+                    "WHERE user_id = ? AND is_active = 1",
+                    (now, user_id)
+                )
             await self._db.commit()
     
     async def set_mode(self, user_id: int, mode: str) -> None:
@@ -144,7 +171,7 @@ class SessionManager:
         """List all sessions (active and archived) for a user."""
         sessions = []
         async with self._db.execute(
-            "SELECT opencode_session_id, model, mode, message_count, created_at, last_active, is_active "
+            "SELECT opencode_session_id, model, mode, message_count, created_at, last_active, is_active, name "
             "FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20",
             (user_id,)
         ) as cursor:
@@ -157,6 +184,7 @@ class SessionManager:
                     "created_at": row[4],
                     "last_active": row[5],
                     "is_active": bool(row[6]),
+                    "name": row[7] if len(row) > 7 else "",
                 })
         return sessions
     
@@ -164,7 +192,7 @@ class SessionManager:
         """Switch a user to a different existing session."""
         # Check if session exists for this user
         async with self._db.execute(
-            "SELECT opencode_session_id, model, mode, message_count, created_at "
+            "SELECT opencode_session_id, model, mode, message_count, created_at, name "
             "FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
             (user_id, session_id)
         ) as cursor:
@@ -195,6 +223,7 @@ class SessionManager:
             "message_count": row[3],
             "created_at": row[4],
             "last_active": now,
+            "name": row[5] or "",
         }
         
         logger.info(f"User {user_id} switched to session {session_id}")

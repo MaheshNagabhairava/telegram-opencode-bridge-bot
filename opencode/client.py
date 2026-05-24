@@ -104,7 +104,9 @@ class OpenCodeClient:
         max_retries: int = 3,
     ) -> None:
         self.server_url: str = server_url.rstrip("/")
-        self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(total=timeout)
+        # Set total to None to disable the timeout in aiohttp if timeout is 0 or None
+        total_timeout = timeout if timeout and timeout > 0 else None
+        self.timeout: aiohttp.ClientTimeout = aiohttp.ClientTimeout(total=total_timeout)
         self.max_retries: int = max_retries
         self._session: Optional[aiohttp.ClientSession] = None
 

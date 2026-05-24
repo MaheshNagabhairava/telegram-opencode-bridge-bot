@@ -96,6 +96,7 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     user_id = update.effective_user.id
     session_mgr = context.bot_data["session_manager"]
+    oc_client = context.bot_data["opencode_client"]
 
     sessions = await session_mgr.list_user_sessions(user_id)
 
@@ -106,8 +107,34 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
+    # Fetch server sessions to get their beautiful generated titles
+    titles_map = {}
+    try:
+        server_sessions = await oc_client.list_sessions()
+        for s in server_sessions:
+            s_id = s.get("id")
+            s_title = s.get("title")
+            if s_id and s_title:
+                titles_map[s_id] = s_title
+    except Exception as e:
+        logger.warning(f"Could not fetch session titles from server: {e}")
+
     lines = ["<b>📋 Your Sessions</b>\n"]
     for s in sessions:
+        s_id = s.get("session_id")
+        # If the server has a beautiful title for this session, use it and update local DB
+        if s_id in titles_map:
+            s["name"] = titles_map[s_id]
+            # Save the updated name to the database in the background
+            try:
+                await session_mgr._db.execute(
+                    "UPDATE sessions SET name = ? WHERE opencode_session_id = ?",
+                    (titles_map[s_id], s_id)
+                )
+                await session_mgr._db.commit()
+            except Exception:
+                pass
+
         lines.append(format_session_info(s))
         lines.append("")
 

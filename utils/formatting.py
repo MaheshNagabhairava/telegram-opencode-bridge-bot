@@ -171,9 +171,12 @@ def format_session_info(session: dict) -> str:
     mode = session.get('mode', 'build')
     msgs = session.get('message_count', 0)
     created = session.get('created_at', 'unknown')[:16]  # Trim to datetime
+    name = session.get('name', '') or ''
     
+    name_line = f"   <b>Conversation:</b> {html.escape(name)}\n" if name else ""
     return (
         f"{active} <code>{short_id}</code>\n"
+        f"{name_line}"
         f"   Model: {html.escape(model)} | Mode: {mode} | Messages: {msgs}\n"
         f"   Created: {created}"
     )

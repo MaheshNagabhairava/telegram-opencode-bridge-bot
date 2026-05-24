@@ -107,7 +107,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # ── 4. Track the message ──────────────────────────────
-    await session_mgr.increment_message_count(user_id)
+    await session_mgr.increment_message_count(user_id, prompt=message_text)
 
     # ── 5. Format and send response ───────────────────────
     if not response_text or response_text == "ABORTED":
@@ -177,15 +177,17 @@ async def _send_to_opencode(oc_client, session_id, prompt, model):
     return response.content
 
 
-async def _keep_typing(update: Update, max_seconds: int = 300) -> None:
+async def _keep_typing(update: Update, max_seconds: int = 3600) -> None:
     """Keep sending typing indicators while we wait for OpenCode.
 
     Telegram typing indicator expires after ~5 seconds, so we
     refresh it every 4 seconds.
     """
+    # If max_seconds is 0 or less, default to 1 hour (3600 seconds)
+    limit = max_seconds if max_seconds and max_seconds > 0 else 3600
     try:
         elapsed = 0
-        while elapsed < max_seconds:
+        while elapsed < limit:
             await update.message.chat.send_action(ChatAction.TYPING)
             await asyncio.sleep(4)
             elapsed += 4
