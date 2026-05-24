@@ -1,0 +1,34 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments and Virtualenvs
+.venv/
+venv/
+ENV/
+env/
+
+# Private configuration/secrets
+.env
+.env.local
+.env.*.local
+
+# Databases
+*.db
+sessions.db
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+
+# OS generated files
+Thumbs.db
+db.db
+Desktop.ini
+.DS_Store
