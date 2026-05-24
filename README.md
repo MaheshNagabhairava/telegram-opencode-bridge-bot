@@ -116,7 +116,7 @@ Telegram Bot (Python)
 | `OPENCODE_MODEL` | Default AI model | `anthropic/claude-sonnet-4` |
 | `OPENCODE_WORK_DIR` | Working directory for OpenCode | `.` |
 | `MAX_MESSAGE_LENGTH` | Max Telegram message length | `4000` |
-| `RESPONSE_TIMEOUT` | Max wait for response (seconds) | `300` |
+| `RESPONSE_TIMEOUT` | Max wait for response (seconds) | `0` |
 | `DB_PATH` | SQLite database path | `sessions.db` |
 
 ## 🔒 Security
