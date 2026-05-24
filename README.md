@@ -47,6 +47,8 @@ Edit `.env` with your values:
 TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
 AUTHORIZED_USERS=your_telegram_user_id
 OPENCODE_MODEL=anthropic/claude-sonnet-4
+OPENCODE_SERVER_URL=http://localhost:4096
+OPENCODE_WORK_DIR="C:\Users\Mahesh  Nagabhairava\Downloads\Research"
 ```
 
 > **💡 Tip:** Don't know your Telegram user ID? Start the bot with `AUTHORIZED_USERS=0` temporarily, send `/id` to the bot, then update the `.env` with your real ID.
