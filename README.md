@@ -56,7 +56,7 @@ OPENCODE_MODEL=anthropic/claude-sonnet-4
 In a separate terminal:
 
 ```bash
-opencode serve --port 4444 --hostname 127.0.0.1
+opencode serve --port 4096 --hostname 127.0.0.1
 ```
 
 This starts the OpenCode HTTP API on `localhost:4096`.
