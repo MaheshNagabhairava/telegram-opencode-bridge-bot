@@ -97,11 +97,9 @@ Telegram User
 Telegram Bot (Python)
     │
     ├──► OpenCode HTTP API (localhost:4096)  ← primary
-    │       │
-    │       ├──► LLM Provider (Claude/GPT/Gemini)
-    │       └──► Local Filesystem & Shell
-    │
-    └──► opencode run (subprocess)  ← fallback
+            │
+            ├──► LLM Provider (Claude/GPT/Gemini)
+            └──► Local Filesystem & Shell
 ```
 
 ## ⚙️ Configuration
