@@ -178,20 +178,19 @@ async def post_init(application) -> None:
     session_mgr = application.bot_data["session_manager"]
     await session_mgr.initialize()
 
-    # Check OpenCode availability
-    oc_client = application.bot_data["opencode_client"]
-    if await oc_client.is_available():
-        logger.info("✅ OpenCode HTTP API is reachable")
-    else:
-        logger.error("❌ OpenCode HTTP API is unreachable! Make sure OpenCode is running:")
-        logger.error("   Start server: opencode serve")
-
-    logger.info("🤖 Bot is ready!")
+    logger.info("🤖 Bot is ready! (OpenCode serve will start lazily on the first message)")
 
 
 async def post_shutdown(application) -> None:
     """Clean up resources on shutdown."""
     logger.info("Shutting down...")
+
+    # Stop the background opencode server process if running
+    try:
+        from opencode.server import stop_server
+        await stop_server()
+    except Exception as e:
+        logger.warning(f"Failed to stop background OpenCode server: {e}")
 
     # Close session manager DB
     session_mgr = application.bot_data.get("session_manager")
@@ -388,6 +387,7 @@ def main():
     application.bot_data["config"] = config
     application.bot_data["opencode_client"] = oc_client
     application.bot_data["session_manager"] = session_mgr
+    application.bot_data["server_started"] = False
 
     # ── Build auth-wrapped handlers ───────────────────────
     handlers = build_authorized_handlers(authorizer, rate_limiter)

@@ -110,6 +110,11 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     oc_client = context.bot_data["opencode_client"]
     config = context.bot_data["config"]
 
+    # Ensure OpenCode server is running dynamically
+    from handlers.messages import ensure_server_running
+    if not await ensure_server_running(update, context, user_id):
+        return
+
     # Resolve the user's current workspace directory
     base_dir = os.path.abspath(config.opencode_work_dir)
     current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
@@ -250,6 +255,11 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = update.effective_user.id
     session_mgr = context.bot_data["session_manager"]
     oc_client = context.bot_data["opencode_client"]
+
+    # Ensure OpenCode server is running dynamically
+    from handlers.messages import ensure_server_running
+    if not await ensure_server_running(update, context, user_id):
+        return
 
     if not context.args:
         await update.message.reply_text(
@@ -444,6 +454,11 @@ async def share_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     session_mgr = context.bot_data["session_manager"]
     oc_client = context.bot_data["opencode_client"]
 
+    # Ensure OpenCode server is running dynamically
+    from handlers.messages import ensure_server_running
+    if not await ensure_server_running(update, context, user_id):
+        return
+
     session_id = await session_mgr.get_active_session(user_id)
     if not session_id:
         await update.message.reply_text(
@@ -505,8 +520,14 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ──────────────────────────────────────────────
 async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """List all available (connected/active) models on the OpenCode server."""
+    user_id = update.effective_user.id
     bot_data = context.bot_data
     oc_client = bot_data["opencode_client"]
+
+    # Ensure OpenCode server is running dynamically
+    from handlers.messages import ensure_server_running
+    if not await ensure_server_running(update, context, user_id):
+        return
 
     await update.message.chat.send_action(ChatAction.TYPING)
 
@@ -570,6 +591,11 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     user_id = update.effective_user.id
     session_mgr = context.bot_data["session_manager"]
     oc_client = context.bot_data["opencode_client"]
+
+    # Ensure OpenCode server is running dynamically
+    from handlers.messages import ensure_server_running
+    if not await ensure_server_running(update, context, user_id):
+        return
 
     session_id = await session_mgr.get_active_session(user_id)
     if not session_id:
@@ -741,88 +767,74 @@ async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         # Save to database
         await session_mgr.set_user_work_dir(user_id, target_path)
 
-        # 6. Dynamic Resume / Clear Logic:
-        # Check if we have a previous session in this workspace on the server first, falling back to local DB.
-        resumed_session_id = None
-        resumed_title = ""
+        # 6. Dynamic Restart & Isolation Logic:
+        # Inform the user that we are switching the project and restarting the OpenCode server to mount the directory.
+        status_msg = await update.message.reply_text(
+            f"⏳ <b>Switching project to:</b> <code>{html.escape(target_folder)}</code>...\n"
+            f"Restarting OpenCode serve backend to physically isolate execution environment...",
+            parse_mode="HTML"
+        )
 
+        async def update_status(text):
+            try:
+                await status_msg.edit_text(text, parse_mode="HTML")
+            except Exception:
+                await update.message.reply_text(text, parse_mode="HTML")
+
+        from urllib.parse import urlparse
         try:
-            # Query server sessions to see if there is any active session in the workspace
-            server_sessions = await oc_client.list_sessions()
-            target_path_norm = norm(target_path)
-            matching_server_sessions = []
-            
-            for s in server_sessions:
-                s_dir = s.get("directory", "")
-                if norm(s_dir) == target_path_norm:
-                    matching_server_sessions.append(s)
-            
-            if matching_server_sessions:
-                # Sort by updated time in descending order to get the latest
-                matching_server_sessions.sort(
-                    key=lambda s: s.get("time", {}).get("updated", 0),
-                    reverse=True
-                )
-                latest_s = matching_server_sessions[0]
-                resumed_session_id = latest_s.get("id")
-                resumed_title = latest_s.get("title", "")
-                
-                # Sync this session to the local DB so that switch_session knows it
-                from datetime import datetime
-                now_iso = datetime.utcnow().isoformat()
-                
-                # Check if it exists locally
-                async with session_mgr._db.execute(
-                    "SELECT opencode_session_id FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
-                    (user_id, resumed_session_id)
-                ) as cursor:
-                    exists_row = await cursor.fetchone()
-                
-                if exists_row:
-                    await session_mgr._db.execute(
-                        "UPDATE sessions SET work_dir = ?, name = ?, last_active = ? WHERE user_id = ? AND opencode_session_id = ?",
-                        (target_path, resumed_title, now_iso, user_id, resumed_session_id)
-                    )
-                else:
-                    await session_mgr._db.execute(
-                        "INSERT INTO sessions (user_id, opencode_session_id, work_dir, name, created_at, last_active, is_active, message_count) "
-                        "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
-                        (user_id, resumed_session_id, target_path, resumed_title, now_iso, now_iso)
-                    )
-                await session_mgr._db.commit()
-                
-        except Exception as e:
-            logger.warning(f"Could not scan server sessions during project switch: {e}")
+            url_parsed = urlparse(config.opencode_server_url)
+            hostname = url_parsed.hostname or "127.0.0.1"
+            port = url_parsed.port or 8080
+        except Exception:
+            hostname = "127.0.0.1"
+            port = 8080
 
-        # Fallback to local DB if server query failed or returned no matches
-        if not resumed_session_id:
-            resumed_session_id = await session_mgr.get_last_session_in_workspace(user_id, target_path)
+        from opencode.server import restart_server
+        restart_success = await restart_server(target_path, port=port, hostname=hostname)
 
-        if resumed_session_id:
-            # Switch to the existing session
-            await session_mgr.switch_session(user_id, resumed_session_id)
-            
-            # Retrieve the session title/name for nicer feedback
-            session_info = await session_mgr.get_session_info(user_id)
-            name = (session_info or {}).get("name", "") or resumed_title
-            name_text = f" (<i>\"{html.escape(name)}\"</i>)" if name else ""
-
-            await update.message.reply_text(
-                f"🔄 <b>Switched project to:</b> <code>{html.escape(target_folder)}</code>\n"
-                f"✨ <b>Resumed last active conversation</b>{name_text} in this workspace!\n\n"
-                f"📍 <i>Path: {html.escape(target_path)}</i>\n\n"
-                f"Just type your message to continue the discussion.",
-                parse_mode="HTML"
+        if not restart_success:
+            await update_status(
+                f"❌ <b>Failed to restart OpenCode server inside the new project directory.</b>\n\n"
+                f"📍 <i>Target Path: {html.escape(target_path)}</i>\n\n"
+                f"Please ensure <code>opencode serve</code> can run on port {port} or check bot logs.",
             )
-        else:
-            # Clear active session so that the next message creates a fresh one in the new folder
-            await session_mgr.clear_session(user_id)
-            await update.message.reply_text(
+            return
+
+        context.bot_data["server_started"] = True
+
+        # Clear the old session from SQLite and active cache
+        await session_mgr.clear_session(user_id)
+
+        # Create a fresh session inside the restarted backend scoped to the target directory
+        try:
+            result = await oc_client.create_session(directory=target_path)
+            if not isinstance(result, dict):
+                raise ValueError("Invalid session response from OpenCode server.")
+            
+            session_id = (
+                result.get("id")
+                or result.get("session_id")
+                or result.get("sessionId")
+            )
+            if not session_id:
+                raise ValueError("Response did not contain a session ID.")
+
+            await session_mgr.set_active_session(user_id, session_id, config.opencode_model, work_dir=target_path)
+
+            await update_status(
                 f"🔄 <b>Switched project to:</b> <code>{html.escape(target_folder)}</code>\n"
-                f"🆕 No previous conversation history found here. <b>Prepared a fresh session!</b>\n\n"
+                f"🚀 <b>OpenCode server restarted & fresh session prepared!</b>\n\n"
                 f"📍 <i>Path: {html.escape(target_path)}</i>\n\n"
-                f"Send your next message to start your new coding conversation.",
-                parse_mode="HTML"
+                f"Deterministic isolation active. Send your next message to start coding!",
+            )
+        except Exception as e:
+            logger.error(f"Failed to create fresh session after server restart: {e}", exc_info=True)
+            await update_status(
+                f"🔄 <b>Switched project to:</b> <code>{html.escape(target_folder)}</code>\n"
+                f"⚠️ Server restarted successfully, but failed to create a new session: <code>{html.escape(str(e))}</code>\n\n"
+                f"📍 <i>Path: {html.escape(target_path)}</i>\n\n"
+                f"Try sending a message; the bot will attempt to auto-heal and create a new session.",
             )
         return
 

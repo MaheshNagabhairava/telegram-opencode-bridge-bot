@@ -14,20 +14,90 @@ from telegram.constants import ChatAction
 
 from utils.formatting import format_opencode_response, split_message, format_error
 from utils.security import sanitize_input
-from opencode.client import OpenCodeAPIError
+from opencode.client import OpenCodeAPIError, OpenCodeConnectionError
 
 logger = logging.getLogger(__name__)
+
+
+async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    """Ensure the OpenCode serve process is running in the correct directory.
+
+    Uses an in-memory flag inside bot_data to avoid redundant local HTTP pings.
+    If the server is offline, it dynamically boots it scoped to the correct directory.
+
+    Returns True if the server is running, False otherwise.
+    """
+    bot_data = context.bot_data
+    config = bot_data["config"]
+    oc_client = bot_data["opencode_client"]
+    session_mgr = bot_data["session_manager"]
+
+    # 1. Check in-memory flag
+    if bot_data.get("server_started"):
+        return True
+
+    # 2. If flag is False, check if the server is already reachable (e.g. started externally)
+    if await oc_client.is_available():
+        bot_data["server_started"] = True
+        return True
+
+    # 3. Server is offline - lazy launch it scoped to the user's active folder
+    import html
+    startup_notice = await update.message.reply_text(
+        "⏳ <b>Initializing OpenCode server...</b>\n"
+        "This happens once on first startup to physically mount your workspace.",
+        parse_mode="HTML"
+    )
+
+    async def update_startup_status(text):
+        try:
+            await startup_notice.edit_text(text, parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text(text, parse_mode="HTML")
+
+    # Resolve last active directory for this user, falling back to default OPENCODE_WORK_DIR
+    work_dir = await session_mgr.get_user_work_dir(user_id, config.opencode_work_dir)
+
+    from urllib.parse import urlparse
+    try:
+        url_parsed = urlparse(config.opencode_server_url)
+        hostname = url_parsed.hostname or "127.0.0.1"
+        port = url_parsed.port or 8080
+    except Exception:
+        hostname = "127.0.0.1"
+        port = 8080
+
+    from opencode.server import restart_server
+    logger.info(f"Lazy launching OpenCode server inside: {work_dir} on port {port}")
+
+    started = await restart_server(work_dir, port=port, hostname=hostname)
+
+    if not started:
+        await update_startup_status(
+            "❌ <b>Failed to start OpenCode server automatically.</b>\n\n"
+            "Please make sure <code>opencode</code> is installed on your system or check the bot logs."
+        )
+        return False
+
+    try:
+        await startup_notice.delete()
+    except Exception:
+        pass
+
+    bot_data["server_started"] = True
+    return True
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming text messages by routing them to OpenCode.
 
     Flow:
-        1. Get or create an OpenCode session for this user
-        2. Send typing indicator
-        3. Forward prompt to OpenCode (HTTP API → subprocess fallback)
-        4. Format and split the response
-        5. Send back to Telegram
+        1. Ensure the OpenCode server is running dynamically
+        2. Get or create an OpenCode session for this user
+        3. Send typing indicator
+        4. Forward prompt to OpenCode (HTTP API → subprocess fallback)
+        5. Format and split the response
+        6. Send back to Telegram
     """
     user = update.effective_user
     user_id = user.id
@@ -41,10 +111,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     oc_client = bot_data["opencode_client"]
     config = bot_data["config"]
 
-    # ── 1. Send typing indicator ──────────────────────────
+    # ── 1. Ensure OpenCode server is running ────────────────
+    if not await ensure_server_running(update, context, user_id):
+        return
+
+    # ── 2. Send typing indicator ──────────────────────────
     await update.message.chat.send_action(ChatAction.TYPING)
 
-    # ── 2. Get or create session ──────────────────────────
+    # ── 3. Get or create session ──────────────────────────
     session_id = await session_mgr.get_active_session(user_id)
 
     if not session_id:
@@ -59,7 +133,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
-    # ── 3. Send prompt to OpenCode ────────────────────────
+    # ── 4. Send prompt to OpenCode ────────────────────────
     # Check if streaming is enabled
     is_streaming = await session_mgr.get_user_streaming(user_id, 0)
     
@@ -97,6 +171,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     prompt=message_text,
                     model=session_model,
                 )
+        except OpenCodeConnectionError as conn_err:
+            # Connection crashed/failed - Reset flag and self-heal!
+            logger.warning(f"Connection lost to OpenCode server: {conn_err}. Attempting to recover...")
+            bot_data["server_started"] = False
+            
+            await update.message.reply_text(
+                "⚠️ <i>Connection to OpenCode server was lost. Attempting to restart server and retry...</i>",
+                parse_mode="HTML",
+            )
+            
+            if await ensure_server_running(update, context, user_id):
+                # Server is back up - recreate session and retry message!
+                session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                session_info = await session_mgr.get_session_info(user_id)
+                session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+                
+                response_text = await _send_to_opencode(
+                    oc_client=oc_client,
+                    session_id=session_id,
+                    prompt=message_text,
+                    model=session_model,
+                )
+            else:
+                raise conn_err
         except OpenCodeAPIError as e:
             # Check if the session is missing on the server (404)
             if e.status == 404:
