@@ -204,7 +204,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def _create_session(oc_client, user_id, session_mgr, config):
     """Create a new OpenCode session and register it."""
-    # Fetch preferred user workspace directory, falling back to base configuration path
     work_dir = await session_mgr.get_user_work_dir(user_id, config.opencode_work_dir)
     
     result = await oc_client.create_session(directory=work_dir)
@@ -220,6 +219,7 @@ async def _create_session(oc_client, user_id, session_mgr, config):
         raise ValueError(f"OpenCode server response did not contain a session ID: {result}")
 
     await session_mgr.set_active_session(user_id, session_id, config.opencode_model, work_dir=work_dir)
+
     return session_id
 
 
