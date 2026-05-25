@@ -26,8 +26,13 @@ A lightweight Python bot that bridges your Telegram messages directly to [OpenCo
 3. **Telegram Bot Token** — get one from [@BotFather](https://t.me/BotFather)
 4. **Your Telegram User ID** — send `/id` to the bot after setup, or use [@userinfobot](https://t.me/userinfobot)
 
-## 🚀 Quick Start
-
+### Quick Installation:
+```bash
+pip install telegram-opencode-bridge-bot==0.1.2
+telegram-opencode-bot
+telegram-opencode-bot --env (use --env flag if u want to re-configure later anytime)
+```
+### Manuall Installation:
 ### 1. Clone & Install
 
 ```bash
