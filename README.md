@@ -35,25 +35,7 @@ cd telegram-opencode-bot
 pip install -r requirements.txt
 ```
 
-### 2. Configure
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env` with your values:
-
-```env
-TELEGRAM_BOT_TOKEN=your_bot_token_from_botfather
-AUTHORIZED_USERS=your_telegram_user_id
-OPENCODE_MODEL=anthropic/claude-sonnet-4
-OPENCODE_SERVER_URL=http://localhost:4096
-OPENCODE_WORK_DIR="C:\Users\Mahesh  Nagabhairava\Downloads\Research"
-```
-
-> **💡 Tip:** Don't know your Telegram user ID? Start the bot with `AUTHORIZED_USERS=0` temporarily, send `/id` to the bot, then update the `.env` with your real ID.
-
-### 3. Start OpenCode Server
+### 2. Start OpenCode Server
 
 In a separate terminal:
 
@@ -63,15 +45,17 @@ opencode serve --port 4096 --hostname 127.0.0.1
 
 This starts the OpenCode HTTP API on `localhost:4096`.
 
-### 4. Run the Bot
+### 3. Run the Bot
 
 ```bash
 python bot.py
+python bot.py --env (if u want to setup ur configuration later)
 ```
+> **💡 Tip:** Don't know your Telegram user ID? Start the bot with `AUTHORIZED_USERS=0` temporarily, send `/id` to the bot, then update the `.env` with your real ID.
 
-### 5. Chat!
+### 4. Chat!
 
-Open Telegram, find your bot, and start coding! 🎉
+Open Telegram, find your bot, and start asking! 🎉
 
 ## 📱 Commands
 
@@ -91,6 +75,8 @@ Open Telegram, find your bot, and start coding! 🎉
 | `/models` | List all available models |
 | `/project` | To view the current workspace, sub folder workspaces and to change the workspace (ex: /project 2)|
 | `/project depth <1to5>` | Depth level recursive check for subfolders (ex: if u give depth 2, only 2 sub folders it will show from root) |
+| `/enable` | To enable the streaming |
+| `/disable` | To disable the streaming |
 
 ## 🏗️ Architecture
 
