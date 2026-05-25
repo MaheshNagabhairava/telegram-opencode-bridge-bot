@@ -60,6 +60,11 @@ class SessionManager:
             await self._db.execute("ALTER TABLE user_settings ADD COLUMN scan_depth INTEGER DEFAULT 2")
         except aiosqlite.OperationalError:
             pass
+
+        try:
+            await self._db.execute("ALTER TABLE user_settings ADD COLUMN streaming INTEGER DEFAULT 0")
+        except aiosqlite.OperationalError:
+            pass
             
         await self._db.execute("""  
             CREATE INDEX IF NOT EXISTS idx_user_active 
@@ -295,6 +300,27 @@ class SessionManager:
         )
         await self._db.commit()
         logger.info(f"Set preferred project scan depth for user {user_id}: {depth}")
+
+    async def get_user_streaming(self, user_id: int, default_val: int = 0) -> int:
+        """Get the user's streaming preference (0 = disabled, 1 = enabled)."""
+        async with self._db.execute(
+            "SELECT streaming FROM user_settings WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+        return default_val
+
+    async def set_user_streaming(self, user_id: int, enabled: int) -> None:
+        """Save or update the user's streaming preference."""
+        await self._db.execute(
+            "INSERT INTO user_settings (user_id, work_dir, scan_depth, streaming) VALUES (?, '', 2, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET streaming = excluded.streaming",
+            (user_id, enabled)
+        )
+        await self._db.commit()
+        logger.info(f"Set preferred streaming for user {user_id}: {enabled}")
 
     async def get_last_session_in_workspace(self, user_id: int, work_dir: str) -> Optional[str]:
         """Find the most recently active session ID for a user in a specific workspace."""

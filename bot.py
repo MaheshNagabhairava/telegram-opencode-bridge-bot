@@ -17,13 +17,17 @@ Usage:
 import asyncio
 import logging
 import sys
+import os
 
+from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
     filters,
+    ContextTypes,
 )
+from utils.formatting import format_error
 
 from config import config
 from opencode.client import OpenCodeClient
@@ -43,6 +47,8 @@ from handlers.commands import (
     models_command,
     stop_command,
     project_command,
+    enable_command,
+    disable_command,
     set_bot_commands,
 )
 from handlers.messages import handle_message
@@ -114,6 +120,14 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         await project_command(update, context)
 
     @authorized(authorizer, rate_limiter)
+    async def _enable(update, context):
+        await enable_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
+    async def _disable(update, context):
+        await disable_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
     async def _message(update, context):
         await handle_message(update, context)
 
@@ -127,12 +141,32 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "models": _models,
         "stop": _stop,
         "project": _project,
+        "enable": _enable,
+        "disable": _disable,
         "mode": _mode,
         "share": _share,
         "status": _status,
         "id": _id,
         "message": _message,
     }
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a Telegram message to notify the user."""
+    # Log the error with traceback
+    logger.error("Exception while handling an update:", exc_info=context.error)
+
+    # Notify the user if the update is a Telegram Update with a message
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            error_message = f"An unexpected error occurred: {context.error}"
+            # Reply to the user with the formatted error
+            await update.effective_message.reply_text(
+                format_error(error_message),
+                parse_mode="HTML"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send error notification message: {e}")
 
 
 async def post_init(application) -> None:
@@ -172,8 +206,141 @@ async def post_shutdown(application) -> None:
     logger.info("Goodbye!")
 
 
+def run_firstrun_setup():
+    """Interactively prompts the user for configuration values and writes them to .env."""
+    print("=" * 60)
+    print("🚀 OpenCode Telegram Bot — Interactive First-Run Setup")
+    print("=" * 60)
+    print("This utility will help you configure your .env file.\n")
+    
+    # 1. Read existing .env values if they exist, to provide defaults
+    current_values = {}
+    if os.path.exists(".env"):
+        try:
+            with open(".env", "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        # Strip quotes if present
+                        v = v.strip().strip("'\"")
+                        current_values[k.strip()] = v
+        except Exception:
+            pass
+
+    # Helper function to ask with default
+    def ask(key, prompt_text, default_val=""):
+        default = current_values.get(key, default_val)
+        default_display = f" [{default}]" if default else ""
+        
+        try:
+            val = input(f"{prompt_text}{default_display}: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nSetup aborted.")
+            sys.exit(1)
+            
+        if not val:
+            return default
+        return val
+
+    # 2. Gather inputs
+    token = ask(
+        "TELEGRAM_BOT_TOKEN", 
+        "1. Enter your TELEGRAM_BOT_TOKEN (from @BotFather)"
+    )
+    while not token:
+        print("❌ TELEGRAM_BOT_TOKEN is required to run the bot!")
+        token = ask("TELEGRAM_BOT_TOKEN", "1. Enter your TELEGRAM_BOT_TOKEN")
+
+    users = ask(
+        "AUTHORIZED_USERS", 
+        "2. Enter AUTHORIZED_USERS (comma-separated Telegram User IDs, e.g. 846469353)"
+    )
+    while not users:
+        print("❌ AUTHORIZED_USERS is required to restrict access to the bot!")
+        users = ask("AUTHORIZED_USERS", "2. Enter AUTHORIZED_USERS")
+
+    server_url = ask(
+        "OPENCODE_SERVER_URL", 
+        "3. Enter OPENCODE_SERVER_URL", 
+        "http://localhost:4096"
+    )
+    
+    username = ask(
+        "OPENCODE_SERVER_USERNAME", 
+        "4. Enter OPENCODE_SERVER_USERNAME (leave blank if no authentication)"
+    )
+    
+    password = ask(
+        "OPENCODE_SERVER_PASSWORD", 
+        "5. Enter OPENCODE_SERVER_PASSWORD (leave blank if no authentication)"
+    )
+    
+    model = ask(
+        "OPENCODE_MODEL", 
+        "6. Enter OPENCODE_MODEL", 
+        "opencode/deepseek-v4-flash-free"
+    )
+    
+    work_dir = ask(
+        "OPENCODE_WORK_DIR", 
+        "7. Enter OPENCODE_WORK_DIR (full path to your parent workspace)", 
+        os.path.abspath(".")
+    )
+
+    # 3. Format and write .env
+    env_content = f"""# Telegram Bot Configuration
+TELEGRAM_BOT_TOKEN={token}
+AUTHORIZED_USERS={users}
+
+# OpenCode Configuration
+OPENCODE_SERVER_URL={server_url}
+OPENCODE_SERVER_USERNAME={username}
+OPENCODE_SERVER_PASSWORD={password}
+OPENCODE_MODEL={model}
+OPENCODE_WORK_DIR="{work_dir}"
+
+# Limits
+MAX_MESSAGE_LENGTH=4000
+RESPONSE_TIMEOUT=0  # Set to 0 to disable request timeouts entirely
+
+# Database
+DB_PATH=sessions.db
+"""
+
+    try:
+        with open(".env", "w", encoding="utf-8") as f:
+            f.write(env_content)
+        print("\n✅ Success! Configuration written to .env file.")
+        print("=" * 60)
+        print("You can now start the bot using:")
+        print("  python bot.py")
+        print("=" * 60 + "\n")
+    except Exception as e:
+        print(f"\n❌ Error writing to .env file: {e}")
+
+
 def main():
     """Build and run the Telegram bot."""
+
+    # If --firstrun CLI flag is passed, or if .env does not exist, run setup
+    if "--firstrun" in sys.argv:
+        run_firstrun_setup()
+        sys.exit(0)
+
+    if not os.path.exists(".env"):
+        print("⚠️ .env file not found!")
+        try:
+            choice = input("Would you like to run the interactive setup now? (y/n): ").strip().lower()
+            if choice in ("y", "yes"):
+                run_firstrun_setup()
+                print("\nSetup complete! Starting the bot...")
+            else:
+                print("Please copy .env.example to .env and configure it before starting.")
+                sys.exit(1)
+        except (KeyboardInterrupt, EOFError):
+            print("\nSetup cancelled.")
+            sys.exit(1)
 
     # ── Validate config ───────────────────────────────────
     try:
@@ -214,6 +381,9 @@ def main():
         .build()
     )
 
+    # ── Register global error handler ─────────────────────
+    application.add_error_handler(error_handler)
+
     # Store components in bot_data for access in handlers
     application.bot_data["config"] = config
     application.bot_data["opencode_client"] = oc_client
@@ -232,6 +402,8 @@ def main():
     application.add_handler(CommandHandler("models", handlers["models"], block=False))
     application.add_handler(CommandHandler("stop", handlers["stop"], block=False))
     application.add_handler(CommandHandler("project", handlers["project"], block=False))
+    application.add_handler(CommandHandler("enable", handlers["enable"], block=False))
+    application.add_handler(CommandHandler("disable", handlers["disable"], block=False))
     application.add_handler(CommandHandler("mode", handlers["mode"], block=False))
     application.add_handler(CommandHandler("share", handlers["share"], block=False))
     application.add_handler(CommandHandler("status", handlers["status"], block=False))

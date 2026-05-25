@@ -56,6 +56,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/stop — Stop/abort the current active task\n"
         "/project — View & switch active project directories\n"
         "/project depth &lt;1-5&gt; — Configure recursive subfolder scan depth\n"
+        "/enable — Enable live tool call & progress streaming\n"
+        "/disable — Disable live progress streaming\n"
         "/sessions — List your recent sessions\n"
         "/switch <code>&lt;id&gt;</code> — Switch to a different session\n"
         "/model <code>&lt;name&gt;</code> — Change AI model\n"
@@ -856,6 +858,42 @@ async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ──────────────────────────────────────────────
+# Command: /enable
+# ──────────────────────────────────────────────
+async def enable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Enable real-time tool execution streaming on Telegram."""
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+
+    await session_mgr.set_user_streaming(user_id, 1)
+
+    await update.message.reply_text(
+        "🚀 <b>Real-time Streaming Enabled!</b>\n\n"
+        "I will now show you what OpenCode is doing (like tool calls, shell commands, and file edits) live on Telegram as it executes!\n\n"
+        "Type /disable at any time to turn it off.",
+        parse_mode="HTML"
+    )
+
+
+# ──────────────────────────────────────────────
+# Command: /disable
+# ──────────────────────────────────────────────
+async def disable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Disable real-time tool execution streaming on Telegram."""
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+
+    await session_mgr.set_user_streaming(user_id, 0)
+
+    await update.message.reply_text(
+        "⏸️ <b>Real-time Streaming Disabled.</b>\n\n"
+        "I will only show you the final outputs from OpenCode.\n\n"
+        "Type /enable to turn it back on.",
+        parse_mode="HTML"
+    )
+
+
+# ──────────────────────────────────────────────
 # Register bot commands for Telegram menu
 # ──────────────────────────────────────────────
 async def set_bot_commands(app) -> None:
@@ -866,6 +904,8 @@ async def set_bot_commands(app) -> None:
         BotCommand("new", "Start a fresh conversation"),
         BotCommand("stop", "Stop/abort the current active task"),
         BotCommand("project", "View & switch project folders"),
+        BotCommand("enable", "Enable live progress streaming"),
+        BotCommand("disable", "Disable live progress streaming"),
         BotCommand("sessions", "List your sessions"),
         BotCommand("switch", "Switch to another session"),
         BotCommand("model", "Change AI model"),

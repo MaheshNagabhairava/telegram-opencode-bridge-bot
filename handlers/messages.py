@@ -60,6 +60,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
     # ── 3. Send prompt to OpenCode ────────────────────────
+    # Check if streaming is enabled
+    is_streaming = await session_mgr.get_user_streaming(user_id, 0)
+    
+    sse_task = None
+    if is_streaming == 1:
+        sse_task = asyncio.create_task(
+            _listen_and_stream_events(update, session_id, config.opencode_server_url)
+        )
+
     typing_task = asyncio.create_task(
         _keep_typing(update, config.response_timeout)
     )
@@ -150,6 +159,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     finally:
         if typing_task:
             typing_task.cancel()
+        if sse_task:
+            sse_task.cancel()
 
     # ── 4. Track the message ──────────────────────────────
     await session_mgr.increment_message_count(user_id, prompt=message_text)
@@ -243,3 +254,131 @@ async def _keep_typing(update: Update, max_seconds: int = 3600) -> None:
         pass  # Expected when response arrives
     except Exception:
         pass  # Don't crash on typing indicator failures
+
+
+async def _listen_and_stream_events(update: Update, session_id: str, server_url: str):
+    """Listens to global OpenCode events via SSE and posts tool-call progress live on Telegram."""
+    import aiohttp
+    import json
+    import html
+
+    url = f"{server_url.rstrip('/')}/global/event"
+    notified_calls = set()
+    completed_calls = set()
+
+    def truncate(text, max_len=500):
+        if not text:
+            return ""
+        text = str(text)
+        if len(text) > max_len:
+            return text[:max_len] + "\n... (truncated)"
+        return text
+
+    async with aiohttp.ClientSession() as sse_session:
+        try:
+            async with sse_session.get(url, headers={"Accept": "text/event-stream"}) as resp:
+                async for line in resp.content:
+                    line_str = line.decode('utf-8').strip()
+                    if not line_str or not line_str.startswith("data:"):
+                        continue
+                    
+                    data_content = line_str[5:].strip()
+                    try:
+                        event_obj = json.loads(data_content)
+                        # Check if sessionID matches
+                        payload = event_obj.get("payload", {})
+                        if not isinstance(payload, dict):
+                            continue
+                        
+                        properties = payload.get("properties", {})
+                        if not isinstance(properties, dict):
+                            continue
+                        
+                        event_session_id = properties.get("sessionID", "")
+                        if event_session_id != session_id:
+                            continue
+
+                        event_type = payload.get("type", "")
+                        if event_type == "message.part.updated":
+                            part = properties.get("part", {})
+                            if not isinstance(part, dict):
+                                continue
+                            
+                            part_type = part.get("type", "")
+                            if part_type == "tool":
+                                tool_name = part.get("tool", "unknown")
+                                call_id = part.get("callID", "unknown")
+                                state = part.get("state", {})
+                                if not isinstance(state, dict):
+                                    continue
+                                
+                                status = state.get("status", "")
+                                input_data = state.get("input", {})
+                                output_data = state.get("output", "")
+                                metadata = state.get("metadata", {})
+                                if not isinstance(metadata, dict):
+                                    metadata = {}
+                                
+                                # 1. Tool Call Started / Running
+                                if status in ("pending", "running") and call_id not in notified_calls:
+                                    notified_calls.add(call_id)
+                                    
+                                    desc = input_data.get("description", "") if isinstance(input_data, dict) else ""
+                                    desc_text = f" — <i>\"{html.escape(desc)}\"</i>" if desc else ""
+                                    
+                                    # Format arguments
+                                    arg_lines = []
+                                    if isinstance(input_data, dict):
+                                        for k, v in input_data.items():
+                                            if k not in ("description", "content"):
+                                                arg_lines.append(f"<b>{html.escape(str(k))}:</b> {html.escape(truncate(str(v)))}")
+                                    args_text = "\n".join(arg_lines)
+                                    
+                                    msg = (
+                                        f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>{desc_text}\n"
+                                    )
+                                    if args_text:
+                                        msg += f"{args_text}\n"
+                                        
+                                    await update.message.reply_text(msg, parse_mode="HTML")
+
+                                # 2. Tool Completed
+                                elif status == "completed" and call_id not in completed_calls:
+                                    completed_calls.add(call_id)
+                                    
+                                    exit_code = metadata.get("exit", 0)
+                                    output_cleaned = truncate(str(output_data))
+                                    
+                                    msg = (
+                                        f"✅ <b>Tool <code>{html.escape(tool_name)}</code> Completed</b> (Exit <code>{exit_code}</code>)\n"
+                                    )
+                                    if output_cleaned.strip():
+                                        msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+                                    else:
+                                        msg += f"<i>(No output returned)</i>"
+                                        
+                                    await update.message.reply_text(msg, parse_mode="HTML")
+
+                                # 3. Tool Failed
+                                elif status in ("failed", "error") and call_id not in completed_calls:
+                                    completed_calls.add(call_id)
+                                    
+                                    output_cleaned = truncate(str(output_data))
+                                    
+                                    msg = (
+                                        f"❌ <b>Tool <code>{html.escape(tool_name)}</code> Failed</b>\n"
+                                    )
+                                    if output_cleaned.strip():
+                                        msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+                                    else:
+                                        msg += f"<i>(No error description returned)</i>"
+                                        
+                                    await update.message.reply_text(msg, parse_mode="HTML")
+
+                    except Exception as e:
+                        logger.debug(f"Error parsing SSE event in listener: {e}")
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"Error in SSE streaming task listener: {e}")
