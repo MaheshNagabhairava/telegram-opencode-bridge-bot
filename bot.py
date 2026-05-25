@@ -323,8 +323,8 @@ DB_PATH=sessions.db
 def main():
     """Build and run the Telegram bot."""
 
-    # If --firstrun CLI flag is passed, or if .env does not exist, run setup
-    if "--firstrun" in sys.argv:
+    # If --env CLI flag is passed, or if .env does not exist, run setup
+    if "--env" in sys.argv:
         run_firstrun_setup()
         sys.exit(0)
 
