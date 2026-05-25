@@ -35,17 +35,7 @@ cd telegram-opencode-bot
 pip install -r requirements.txt
 ```
 
-### 2. Start OpenCode Server
-
-In a separate terminal:
-
-```bash
-opencode serve --port 4096 --hostname 127.0.0.1
-```
-
-This starts the OpenCode HTTP API on `localhost:4096`.
-
-### 3. Run the Bot
+### 2. Run the Bot
 
 ```bash
 python bot.py
@@ -53,7 +43,7 @@ python bot.py --env (if u want to setup ur configuration later)
 ```
 > **💡 Tip:** Don't know your Telegram user ID? Start the bot with `AUTHORIZED_USERS=0` temporarily, send `/id` to the bot, then update the `.env` with your real ID.
 
-### 4. Chat!
+### 3. Chat!
 
 Open Telegram, find your bot, and start asking! 🎉
 
