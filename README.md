@@ -39,7 +39,7 @@ pip install -r requirements.txt
 
 ```bash
 python bot.py
-python bot.py --env (if u want to setup ur configuration later)
+python bot.py --env (use --env flag if u want to re-configure later anytime)
 ```
 > **💡 Tip:** Don't know your Telegram user ID? Start the bot with `AUTHORIZED_USERS=0` temporarily, send `/id` to the bot, then update the `.env` with your real ID.
 
