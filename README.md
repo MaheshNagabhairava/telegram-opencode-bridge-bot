@@ -12,7 +12,7 @@ A lightweight Python bot that bridges your Telegram messages directly to [OpenCo
 - **Smart formatting** — code blocks with syntax highlighting in Telegram
 - **Auto message splitting** — handles responses longer than Telegram's 4096 char limit
 - **Security** — whitelist-based access control + rate limiting
-- **Subprocess fallback** — works even without `opencode serve` via CLI
+- **Workspace Switching** — Switching from one workspace to another
 
 ## 📋 Prerequisites
 
@@ -125,7 +125,6 @@ Telegram Bot (Python)
 
 - **User whitelist** — only Telegram user IDs in `AUTHORIZED_USERS` can use the bot
 - **Rate limiting** — 20 requests per minute per user (configurable)
-- **Input sanitization** — inputs are trimmed and length-limited
 - **No public exposure** — designed to run on your local machine
 
 > ⚠️ **Warning:** This bot executes AI-driven code on your machine. Only authorize trusted users.
@@ -141,7 +140,7 @@ telegram-opencode-bot/
 │   └── messages.py         # Text message → OpenCode bridge
 ├── opencode/
 │   ├── client.py           # OpenCode HTTP API client
-│   └── subprocess.py       # Fallback CLI executor
+│   
 ├── sessions/
 │   └── manager.py          # Per-user session tracking (SQLite)
 ├── utils/
