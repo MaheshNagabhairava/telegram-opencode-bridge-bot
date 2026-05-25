@@ -58,6 +58,9 @@ class Config:
     opencode_work_dir: str = field(
         default_factory=lambda: os.getenv('OPENCODE_WORK_DIR', '.')
     )
+    project_scan_depth: int = field(
+        default_factory=lambda: int(os.getenv('PROJECT_SCAN_DEPTH', '2'))
+    )
 
     # Limits
     max_message_length: int = field(

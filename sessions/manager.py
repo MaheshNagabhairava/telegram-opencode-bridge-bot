@@ -18,6 +18,8 @@ class SessionManager:
     async def initialize(self) -> None:
         """Initialize the database and create tables if needed."""
         self._db = await aiosqlite.connect(self.db_path)
+        
+        # 1. Create sessions table with work_dir support
         await self._db.execute("""   
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,15 +31,34 @@ class SessionManager:
                 created_at TEXT NOT NULL,
                 last_active TEXT NOT NULL,
                 is_active INTEGER DEFAULT 1,
-                name TEXT DEFAULT ''
+                name TEXT DEFAULT '',
+                work_dir TEXT DEFAULT ''
             )
         """)
         
-        # Safely migrate existing databases to add the 'name' column if missing
+        # 2. Create user settings table for preferred workspace directories and scan depth
+        await self._db.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                work_dir TEXT NOT NULL,
+                scan_depth INTEGER DEFAULT 2
+            )
+        """)
+        
+        # 3. Safely migrate existing databases to add columns if missing
         try:
             await self._db.execute("ALTER TABLE sessions ADD COLUMN name TEXT DEFAULT ''")
         except aiosqlite.OperationalError:
-            # Column already exists
+            pass
+            
+        try:
+            await self._db.execute("ALTER TABLE sessions ADD COLUMN work_dir TEXT DEFAULT ''")
+        except aiosqlite.OperationalError:
+            pass
+
+        try:
+            await self._db.execute("ALTER TABLE user_settings ADD COLUMN scan_depth INTEGER DEFAULT 2")
+        except aiosqlite.OperationalError:
             pass
             
         await self._db.execute("""  
@@ -46,9 +67,9 @@ class SessionManager:
         """)
         await self._db.commit()
         
-        # Load active sessions into memory
+        # 4. Load active sessions into memory
         async with self._db.execute(
-            "SELECT user_id, opencode_session_id, model, mode, message_count, created_at, last_active, name "
+            "SELECT user_id, opencode_session_id, model, mode, message_count, created_at, last_active, name, work_dir "
             "FROM sessions WHERE is_active = 1"
         ) as cursor:
             async for row in cursor:
@@ -60,6 +81,7 @@ class SessionManager:
                     "created_at": row[5],
                     "last_active": row[6],
                     "name": row[7] if len(row) > 7 else "",
+                    "work_dir": row[8] if len(row) > 8 else "",
                 }
         
         logger.info(f"Session manager initialized. {len(self._active_sessions)} active sessions loaded.")
@@ -74,7 +96,7 @@ class SessionManager:
         return self._active_sessions.get(user_id)
     
     async def set_active_session(
-        self, user_id: int, opencode_session_id: str, model: str = ""
+        self, user_id: int, opencode_session_id: str, model: str = "", work_dir: str = ""
     ) -> None:
         """Set or create an active session for a user."""
         now = datetime.utcnow().isoformat()
@@ -88,8 +110,8 @@ class SessionManager:
         
         # Insert new active session
         await self._db.execute(
-            "INSERT INTO sessions (user_id, opencode_session_id, model, created_at, last_active, name) VALUES (?, ?, ?, ?, ?, ?)",
-            (user_id, opencode_session_id, model, now, now, "")
+            "INSERT INTO sessions (user_id, opencode_session_id, model, created_at, last_active, name, work_dir) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (user_id, opencode_session_id, model, now, now, "", work_dir)
         )
         await self._db.commit()
         
@@ -102,6 +124,7 @@ class SessionManager:
             "created_at": now,
             "last_active": now,
             "name": "",
+            "work_dir": work_dir,
         }
         
         logger.info(f"New session for user {user_id}: {opencode_session_id}")
@@ -171,7 +194,7 @@ class SessionManager:
         """List all sessions (active and archived) for a user."""
         sessions = []
         async with self._db.execute(
-            "SELECT opencode_session_id, model, mode, message_count, created_at, last_active, is_active, name "
+            "SELECT opencode_session_id, model, mode, message_count, created_at, last_active, is_active, name, work_dir "
             "FROM sessions WHERE user_id = ? ORDER BY created_at DESC LIMIT 20",
             (user_id,)
         ) as cursor:
@@ -185,6 +208,7 @@ class SessionManager:
                     "last_active": row[5],
                     "is_active": bool(row[6]),
                     "name": row[7] if len(row) > 7 else "",
+                    "work_dir": row[8] if len(row) > 8 else "",
                 })
         return sessions
     
@@ -192,7 +216,7 @@ class SessionManager:
         """Switch a user to a different existing session."""
         # Check if session exists for this user
         async with self._db.execute(
-            "SELECT opencode_session_id, model, mode, message_count, created_at, name "
+            "SELECT opencode_session_id, model, mode, message_count, created_at, name, work_dir "
             "FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
             (user_id, session_id)
         ) as cursor:
@@ -224,10 +248,66 @@ class SessionManager:
             "created_at": row[4],
             "last_active": now,
             "name": row[5] or "",
+            "work_dir": row[6] or "",
         }
         
         logger.info(f"User {user_id} switched to session {session_id}")
         return True
+
+    async def get_user_work_dir(self, user_id: int, default_dir: str) -> str:
+        """Get the active workspace/project directory for a specific user, falling back to default."""
+        async with self._db.execute(
+            "SELECT work_dir FROM user_settings WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+        return default_dir
+
+    async def set_user_work_dir(self, user_id: int, work_dir: str) -> None:
+        """Save or update the preferred workspace directory for a user, preserving scan_depth."""
+        await self._db.execute(
+            "INSERT INTO user_settings (user_id, work_dir, scan_depth) VALUES (?, ?, 2) "
+            "ON CONFLICT(user_id) DO UPDATE SET work_dir = excluded.work_dir",
+            (user_id, work_dir)
+        )
+        await self._db.commit()
+        logger.info(f"Set preferred project directory for user {user_id}: {work_dir}")
+
+    async def get_user_scan_depth(self, user_id: int, default_depth: int = 2) -> int:
+        """Get the preferred recursive scan depth for a specific user, falling back to default."""
+        async with self._db.execute(
+            "SELECT scan_depth FROM user_settings WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0] is not None:
+                return int(row[0])
+        return default_depth
+
+    async def set_user_scan_depth(self, user_id: int, depth: int) -> None:
+        """Save or update the preferred recursive scan depth for a user, preserving work_dir."""
+        await self._db.execute(
+            "INSERT INTO user_settings (user_id, work_dir, scan_depth) VALUES (?, '', ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET scan_depth = excluded.scan_depth",
+            (user_id, depth)
+        )
+        await self._db.commit()
+        logger.info(f"Set preferred project scan depth for user {user_id}: {depth}")
+
+    async def get_last_session_in_workspace(self, user_id: int, work_dir: str) -> Optional[str]:
+        """Find the most recently active session ID for a user in a specific workspace."""
+        async with self._db.execute(
+            "SELECT opencode_session_id FROM sessions "
+            "WHERE user_id = ? AND work_dir = ? "
+            "ORDER BY last_active DESC LIMIT 1",
+            (user_id, work_dir)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row:
+                return row[0]
+        return None
     
     async def close(self) -> None:
         """Close the database connection."""

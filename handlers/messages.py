@@ -14,6 +14,7 @@ from telegram.constants import ChatAction
 
 from utils.formatting import format_opencode_response, split_message, format_error
 from utils.security import sanitize_input
+from opencode.client import OpenCodeAPIError
 
 logger = logging.getLogger(__name__)
 
@@ -59,29 +60,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
     # ── 3. Send prompt to OpenCode ────────────────────────
+    typing_task = asyncio.create_task(
+        _keep_typing(update, config.response_timeout)
+    )
     try:
-        # Keep typing indicator alive during long operations
-        typing_task = asyncio.create_task(
-            _keep_typing(update, config.response_timeout)
-        )
-
         session_info = await session_mgr.get_session_info(user_id)
         session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
 
-        response_text = await _send_to_opencode(
-            oc_client=oc_client,
-            session_id=session_id,
-            prompt=message_text,
-            model=session_model,
-        )
-
-        if response_text is None:
-            # Session expired or was deleted/lost on the OpenCode server (e.g. server restart)
-            logger.warning(f"Session {session_id[:8]}... not found on server (returned null). Creating a new session and retrying...")
-            session_id = await _create_session(oc_client, user_id, session_mgr, config)
-            # Re-fetch model for safe retry
-            session_info = await session_mgr.get_session_info(user_id)
-            session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+        try:
             response_text = await _send_to_opencode(
                 oc_client=oc_client,
                 session_id=session_id,
@@ -89,12 +75,68 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 model=session_model,
             )
 
-        typing_task.cancel()
+            if response_text is None:
+                # Session expired or was deleted/lost on the OpenCode server (e.g. server restart)
+                logger.warning(f"Session {session_id[:8]}... not found on server (returned null). Creating a new session and retrying...")
+                session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                # Re-fetch model for safe retry
+                session_info = await session_mgr.get_session_info(user_id)
+                session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+                response_text = await _send_to_opencode(
+                    oc_client=oc_client,
+                    session_id=session_id,
+                    prompt=message_text,
+                    model=session_model,
+                )
+        except OpenCodeAPIError as e:
+            # Check if the session is missing on the server (404)
+            if e.status == 404:
+                logger.warning(f"Session {session_id[:8]}... not found on server (HTTP 404). Starting a new one...")
+                # Delete the deleted session from DB
+                try:
+                    await session_mgr._db.execute(
+                        "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
+                        (user_id, session_id)
+                    )
+                    await session_mgr._db.commit()
+                except Exception:
+                    pass
+                
+                # Clear cache
+                if user_id in session_mgr._active_sessions:
+                    del session_mgr._active_sessions[user_id]
+                    
+                # Create a brand new session and retry
+                session_id = await _create_session(oc_client, user_id, session_mgr, config)
+                session_info = await session_mgr.get_session_info(user_id)
+                session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+                
+                await update.message.reply_text(
+                    "⚠️ <i>Active session was deleted or expired on the server. Starting a fresh session...</i>",
+                    parse_mode="HTML",
+                )
+                
+                # Retry sending
+                response_text = await _send_to_opencode(
+                    oc_client=oc_client,
+                    session_id=session_id,
+                    prompt=message_text,
+                    model=session_model,
+                )
+            else:
+                raise
 
     except asyncio.TimeoutError:
         await update.message.reply_text(
             "⏰ <b>Request timed out.</b>\n\n"
             "OpenCode took too long to respond. Try a simpler prompt or check the server.",
+            parse_mode="HTML",
+        )
+        return
+    except OpenCodeAPIError as e:
+        logger.error(f"OpenCode API error: {e}", exc_info=True)
+        await update.message.reply_text(
+            format_error(str(e)),
             parse_mode="HTML",
         )
         return
@@ -105,6 +147,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode="HTML",
         )
         return
+    finally:
+        if typing_task:
+            typing_task.cancel()
 
     # ── 4. Track the message ──────────────────────────────
     await session_mgr.increment_message_count(user_id, prompt=message_text)
@@ -148,7 +193,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 async def _create_session(oc_client, user_id, session_mgr, config):
     """Create a new OpenCode session and register it."""
-    result = await oc_client.create_session(directory=config.opencode_work_dir)
+    # Fetch preferred user workspace directory, falling back to base configuration path
+    work_dir = await session_mgr.get_user_work_dir(user_id, config.opencode_work_dir)
+    
+    result = await oc_client.create_session(directory=work_dir)
     if not isinstance(result, dict):
         raise ValueError(f"Invalid session response from OpenCode server: {result}")
     
@@ -160,7 +208,7 @@ async def _create_session(oc_client, user_id, session_mgr, config):
     if not session_id:
         raise ValueError(f"OpenCode server response did not contain a session ID: {result}")
 
-    await session_mgr.set_active_session(user_id, session_id, config.opencode_model)
+    await session_mgr.set_active_session(user_id, session_id, config.opencode_model, work_dir=work_dir)
     return session_id
 
 

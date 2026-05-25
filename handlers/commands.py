@@ -8,7 +8,7 @@ Handles all slash commands: /start, /help, /new, /sessions, /switch,
 import html
 import logging
 
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
@@ -54,9 +54,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/help — Show this help message\n"
         "/new — Start a fresh conversation (clears current session)\n"
         "/stop — Stop/abort the current active task\n"
+        "/project — View & switch active project directories\n"
+        "/project depth &lt;1-5&gt; — Configure recursive subfolder scan depth\n"
         "/sessions — List your recent sessions\n"
         "/switch <code>&lt;id&gt;</code> — Switch to a different session\n"
         "/model <code>&lt;name&gt;</code> — Change AI model\n"
+        "/models — List all available models\n"
         "/mode <code>&lt;plan|build&gt;</code> — Toggle plan/build mode\n"
         "/share — Share current session (get public URL)\n"
         "/status — Show bot & connection status\n"
@@ -91,56 +94,150 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # Command: /sessions
 # ──────────────────────────────────────────────
 async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List recent sessions for this user."""
+    """List recent sessions for this user in their active workspace.
+
+    Uses the OpenCode server as the source of truth.  Sessions are filtered
+    by matching the server's `directory` field to the user's currently
+    active workspace, exactly like the OpenCode GUI does.
+    """
+    import os
     from utils.formatting import format_session_info
 
     user_id = update.effective_user.id
     session_mgr = context.bot_data["session_manager"]
     oc_client = context.bot_data["opencode_client"]
+    config = context.bot_data["config"]
 
-    sessions = await session_mgr.list_user_sessions(user_id)
+    # Resolve the user's current workspace directory
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+    current_dir = os.path.abspath(current_dir)
 
-    if not sessions:
+    def norm(p):
+        if not p:
+            return ""
+        return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+    current_dir_norm = norm(current_dir)
+
+    # -- 1. Fetch ALL sessions from the server ---------
+    server_sessions = []
+    server_session_ids = set()
+    try:
+        server_sessions = await oc_client.list_sessions()
+        server_session_ids = {s.get("id") for s in server_sessions if s.get("id")}
+    except Exception as e:
+        logger.warning(f"Could not fetch sessions from server: {e}")
         await update.message.reply_text(
-            "📭 No sessions found. Send a message to start one!",
+            "⚠️ Could not reach the OpenCode server to list sessions.\n"
+            "Make sure <code>opencode serve</code> is running.",
             parse_mode="HTML",
         )
         return
 
-    # Fetch server sessions to get their beautiful generated titles
-    titles_map = {}
-    try:
-        server_sessions = await oc_client.list_sessions()
-        for s in server_sessions:
-            s_id = s.get("id")
-            s_title = s.get("title")
-            if s_id and s_title:
-                titles_map[s_id] = s_title
-    except Exception as e:
-        logger.warning(f"Could not fetch session titles from server: {e}")
+    # -- 2. Prune local DB: delete any sessions not on the server --
+    local_sessions = await session_mgr.list_user_sessions(user_id)
+    local_ids = [s.get("session_id") for s in local_sessions]
+    stale_ids = [sid for sid in local_ids if sid not in server_session_ids]
+    if stale_ids:
+        for sid in stale_ids:
+            try:
+                await session_mgr._db.execute(
+                    "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
+                    (user_id, sid)
+                )
+            except Exception as e:
+                logger.error(f"Error pruning session {sid}: {e}")
+        await session_mgr._db.commit()
 
-    lines = ["<b>📋 Your Sessions</b>\n"]
-    for s in sessions:
-        s_id = s.get("session_id")
-        # If the server has a beautiful title for this session, use it and update local DB
-        if s_id in titles_map:
-            s["name"] = titles_map[s_id]
-            # Save the updated name to the database in the background
+        # Clear active session cache if it was pruned
+        active_sid = await session_mgr.get_active_session(user_id)
+        if active_sid in stale_ids:
+            if user_id in session_mgr._active_sessions:
+                del session_mgr._active_sessions[user_id]
+
+    # -- 3. Filter server sessions to the current workspace --
+    workspace_sessions = []
+    for s in server_sessions:
+        s_dir = s.get("directory", "")
+        if norm(s_dir) == current_dir_norm:
+            workspace_sessions.append(s)
+
+    if not workspace_sessions:
+        folder_name = os.path.basename(current_dir) or "Root"
+        await update.message.reply_text(
+            f"📭 No sessions found in project <b>{html.escape(folder_name)}</b>.\n"
+            f"Send a message to start one!",
+            parse_mode="HTML",
+        )
+        return
+
+    # -- 4. Build the display list ----------------------
+    workspace_sessions.sort(
+        key=lambda s: s.get("time", {}).get("updated", 0),
+        reverse=True,
+    )
+
+    # Lookup locally-tracked data (message counts, model, etc.)
+    refreshed_local = await session_mgr.list_user_sessions(user_id)
+    local_map = {ls.get("session_id"): ls for ls in refreshed_local}
+    active_sid = await session_mgr.get_active_session(user_id)
+
+    folder_name = os.path.basename(current_dir) or "Root"
+    lines = [f"<b>📋 Sessions in {html.escape(folder_name)}</b>\n"]
+
+    for s in workspace_sessions:
+        s_id = s.get("id", "")
+        s_title = s.get("title", "")
+        local_info = local_map.get(s_id, {})
+
+        display = {
+            "session_id": s_id,
+            "name": s_title,
+            "is_active": (s_id == active_sid),
+            "message_count": local_info.get("message_count", 0),
+            "created_at": "",
+            "last_active": "",
+            "model": local_info.get("model", ""),
+            "mode": local_info.get("mode", "build"),
+        }
+
+        time_obj = s.get("time", {})
+        if time_obj.get("created"):
+            from datetime import datetime, timezone
+            try:
+                display["created_at"] = datetime.fromtimestamp(
+                    time_obj["created"] / 1000, tz=timezone.utc
+                ).isoformat()
+            except Exception:
+                pass
+        if time_obj.get("updated"):
+            from datetime import datetime, timezone
+            try:
+                display["last_active"] = datetime.fromtimestamp(
+                    time_obj["updated"] / 1000, tz=timezone.utc
+                ).isoformat()
+            except Exception:
+                pass
+
+        lines.append(format_session_info(display))
+        lines.append("")
+
+        # Update local DB title in background
+        if s_title and s_id in local_map:
             try:
                 await session_mgr._db.execute(
                     "UPDATE sessions SET name = ? WHERE opencode_session_id = ?",
-                    (titles_map[s_id], s_id)
+                    (s_title, s_id)
                 )
                 await session_mgr._db.commit()
             except Exception:
                 pass
 
-        lines.append(format_session_info(s))
-        lines.append("")
-
     lines.append("\n<i>Use /switch &lt;id&gt; to switch sessions</i>")
 
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
 
 
 # ──────────────────────────────────────────────
@@ -150,6 +247,7 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Switch to a different session."""
     user_id = update.effective_user.id
     session_mgr = context.bot_data["session_manager"]
+    oc_client = context.bot_data["opencode_client"]
 
     if not context.args:
         await update.message.reply_text(
@@ -159,17 +257,104 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-    target_id = context.args[0]
-    success = await session_mgr.switch_session(user_id, target_id)
+    target_id = context.args[0].strip()
+    
+    # 1. Resolve short ID prefix to full ID if necessary
+    resolved_id = None
+    server_sessions = []
+    
+    try:
+        server_sessions = await oc_client.list_sessions()
+        for s in server_sessions:
+            s_id = s.get("id", "")
+            if s_id.lower().startswith(target_id.lower()):
+                resolved_id = s_id
+                break
+    except Exception as e:
+        logger.warning(f"Could not verify session list on server during switch resolution: {e}")
+
+    # Fallback to local DB if server query failed or returned no matches
+    if not resolved_id:
+        try:
+            local_sessions = await session_mgr.list_user_sessions(user_id)
+            for s in local_sessions:
+                s_id = s.get("session_id", "")
+                if s_id.lower().startswith(target_id.lower()):
+                    resolved_id = s_id
+                    break
+        except Exception as e:
+            logger.warning(f"Could not fetch local sessions during switch resolution: {e}")
+
+    if not resolved_id:
+        resolved_id = target_id
+
+    # 2. Check if the resolved session exists on the server (if server is online)
+    if server_sessions:
+        server_session_ids = {s.get("id") for s in server_sessions if s.get("id")}
+        if resolved_id not in server_session_ids:
+            # Delete it from local DB as it was deleted on the server!
+            try:
+                await session_mgr._db.execute(
+                    "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
+                    (user_id, resolved_id)
+                )
+                await session_mgr._db.commit()
+            except Exception:
+                pass
+            
+            # Clean active sessions cache if needed
+            if user_id in session_mgr._active_sessions and session_mgr._active_sessions[user_id]["session_id"] == resolved_id:
+                del session_mgr._active_sessions[user_id]
+                
+            await update.message.reply_text(
+                f"❌ Session <code>{html.escape(resolved_id[:8])}</code> has been deleted on the server.\n"
+                f"Use /sessions to see your current sessions.",
+                parse_mode="HTML",
+            )
+            return
+
+    # 3. Switch to the session in local database
+    success = await session_mgr.switch_session(user_id, resolved_id)
+
+    # 4. If not found locally but exists on the server, dynamically register it in local DB and switch!
+    if not success and server_sessions:
+        server_session_ids = {s.get("id") for s in server_sessions if s.get("id")}
+        if resolved_id in server_session_ids:
+            # Find the session object
+            s_obj = None
+            for s in server_sessions:
+                if s.get("id") == resolved_id:
+                    s_obj = s
+                    break
+            
+            if s_obj:
+                s_dir = s_obj.get("directory", "")
+                s_title = s_obj.get("title", "")
+                
+                from datetime import datetime
+                now_iso = datetime.utcnow().isoformat()
+                
+                # Insert into local DB
+                try:
+                    await session_mgr._db.execute(
+                        "INSERT INTO sessions (user_id, opencode_session_id, work_dir, name, created_at, last_active, is_active, message_count) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+                        (user_id, resolved_id, s_dir, s_title, now_iso, now_iso)
+                    )
+                    await session_mgr._db.commit()
+                    # Switch again
+                    success = await session_mgr.switch_session(user_id, resolved_id)
+                except Exception:
+                    pass
 
     if success:
         await update.message.reply_text(
-            f"✅ Switched to session <code>{html.escape(target_id[:8])}</code>",
+            f"✅ Switched to session <code>{html.escape(resolved_id[:8])}</code>",
             parse_mode="HTML",
         )
     else:
         await update.message.reply_text(
-            f"❌ Session <code>{html.escape(target_id[:8])}</code> not found.\n"
+            f"❌ Session <code>{html.escape(resolved_id[:8])}</code> not found.\n"
             f"Use /sessions to see your sessions.",
             parse_mode="HTML",
         )
@@ -405,6 +590,272 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ──────────────────────────────────────────────
+# Command: /project
+# ──────────────────────────────────────────────
+async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List project directories or switch to one by number or name."""
+    import os
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    config = context.bot_data["config"]
+    oc_client = context.bot_data["opencode_client"]
+
+    def norm(p):
+        if not p:
+            return ""
+        return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+    # 1. Base directory is the workspace parent folder configured in .env
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    
+    # 2. Get user's current working directory and scan settings
+    current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+    current_dir = os.path.abspath(current_dir)
+    
+    user_depth = await session_mgr.get_user_scan_depth(user_id, config.project_scan_depth)
+
+    # 3. Check if the user is changing the scan depth setting
+    if context.args and context.args[0].lower() in ("depth", "level", "levels"):
+        if len(context.args) > 1 and context.args[1].isdigit():
+            new_depth = int(context.args[1])
+            if 1 <= new_depth <= 5: # Limit depth between 1 and 5 for safety and speed
+                await session_mgr.set_user_scan_depth(user_id, new_depth)
+                await update.message.reply_text(
+                    f"⚙️ <b>Scan depth updated successfully!</b>\n"
+                    f"Projects will now be scanned up to <b>{new_depth}</b> level(s) deep inside your parent workspace.\n\n"
+                    f"Type /project to see the updated list!",
+                    parse_mode="HTML"
+                )
+                return
+            else:
+                await update.message.reply_text(
+                    "⚠️ Invalid depth level. Please choose a depth level between 1 and 5.",
+                    parse_mode="HTML"
+                )
+                return
+        else:
+            await update.message.reply_text(
+                "⚠️ Usage: <code>/project depth &lt;number&gt;</code>\n"
+                "Example: <code>/project depth 2</code> (scans up to 2 levels deep)",
+                parse_mode="HTML"
+            )
+            return
+
+    # 4. Pruned recursive scanning function to list project subfolders
+    def scan_projects_recursive(current_dir, parent_dir, max_depth=3, current_depth=1):
+        if current_depth > max_depth:
+            return []
+        
+        ignore_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules", ".gemini", ".idea", ".vscode", "build", "dist", ".next"}
+        found_projects = []
+        try:
+            for name in sorted(os.listdir(current_dir)):
+                if name.startswith(".") or name in ignore_dirs:
+                    continue
+                full_path = os.path.join(current_dir, name)
+                if os.path.isdir(full_path):
+                    # Relpath from parent_dir
+                    rel_path = os.path.relpath(full_path, parent_dir)
+                    found_projects.append(rel_path)
+                    # Recurse down
+                    found_projects.extend(scan_projects_recursive(full_path, parent_dir, max_depth, current_depth + 1))
+        except Exception:
+            pass
+        return found_projects
+
+    try:
+        if not os.path.exists(base_dir) or not os.path.isdir(base_dir):
+            await update.message.reply_text(
+                f"❌ <b>Workspace directory does not exist:</b>\n<code>{html.escape(base_dir)}</code>",
+                parse_mode="HTML"
+            )
+            return
+
+        # Scan subfolders recursively (up to user-configured depth)
+        projects = scan_projects_recursive(base_dir, base_dir, max_depth=user_depth)
+    except Exception as e:
+        logger.error(f"Failed to scan workspace directory {base_dir}: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ <b>Error scanning projects folder:</b>\n<code>{html.escape(str(e))}</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    # 5. Check if we received an argument to switch
+    if context.args:
+        arg = " ".join(context.args).strip()
+        target_folder = None
+        target_path = None
+
+        # Check if the user specified the root workspace (0, 'root', or the base dir name)
+        base_name = os.path.basename(base_dir)
+        if arg == "0" or arg.lower() in ("root", "root workspace", "root workspace root", base_name.lower()):
+            target_folder = f"[Root] {base_name}"
+            target_path = base_dir
+        # Check if the argument is a valid absolute path on the system
+        elif os.path.isabs(arg) and os.path.isdir(arg):
+            target_path = os.path.abspath(arg)
+            target_folder = os.path.basename(target_path) or "Root"
+        # Check if argument is a number from the projects list
+        elif arg.isdigit():
+            idx = int(arg) - 1
+            if 0 <= idx < len(projects):
+                target_folder = projects[idx].replace('\\', '/')
+                target_path = os.path.abspath(os.path.join(base_dir, projects[idx]))
+            else:
+                await update.message.reply_text(
+                    f"⚠️ Invalid project number. Choose a number between 1 and {len(projects)}, or 0 for Root Workspace.",
+                    parse_mode="HTML"
+                )
+                return
+        else:
+            # Case-insensitive name match inside subfolders (checks full relative path or leaf folder name)
+            for p in projects:
+                folder_name = os.path.basename(p)
+                p_display = p.replace('\\', '/')
+                if p.lower() == arg.lower() or p_display.lower() == arg.lower() or folder_name.lower() == arg.lower():
+                    target_folder = p_display
+                    target_path = os.path.abspath(os.path.join(base_dir, p))
+                    break
+            
+            # If no exact name match, try a partial match inside subfolders
+            if not target_path:
+                for p in projects:
+                    folder_name = os.path.basename(p)
+                    p_display = p.replace('\\', '/')
+                    if arg.lower() in p.lower() or arg.lower() in folder_name.lower():
+                        target_folder = p_display
+                        target_path = os.path.abspath(os.path.join(base_dir, p))
+                        break
+
+        if not target_path:
+            await update.message.reply_text(
+                f"⚠️ Project folder <code>{html.escape(arg)}</code> not found inside your workspace directory.\n\n"
+                f"Type /project to see the list of available projects.",
+                parse_mode="HTML"
+            )
+            return
+
+        # Save to database
+        await session_mgr.set_user_work_dir(user_id, target_path)
+
+        # 6. Dynamic Resume / Clear Logic:
+        # Check if we have a previous session in this workspace on the server first, falling back to local DB.
+        resumed_session_id = None
+        resumed_title = ""
+
+        try:
+            # Query server sessions to see if there is any active session in the workspace
+            server_sessions = await oc_client.list_sessions()
+            target_path_norm = norm(target_path)
+            matching_server_sessions = []
+            
+            for s in server_sessions:
+                s_dir = s.get("directory", "")
+                if norm(s_dir) == target_path_norm:
+                    matching_server_sessions.append(s)
+            
+            if matching_server_sessions:
+                # Sort by updated time in descending order to get the latest
+                matching_server_sessions.sort(
+                    key=lambda s: s.get("time", {}).get("updated", 0),
+                    reverse=True
+                )
+                latest_s = matching_server_sessions[0]
+                resumed_session_id = latest_s.get("id")
+                resumed_title = latest_s.get("title", "")
+                
+                # Sync this session to the local DB so that switch_session knows it
+                from datetime import datetime
+                now_iso = datetime.utcnow().isoformat()
+                
+                # Check if it exists locally
+                async with session_mgr._db.execute(
+                    "SELECT opencode_session_id FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
+                    (user_id, resumed_session_id)
+                ) as cursor:
+                    exists_row = await cursor.fetchone()
+                
+                if exists_row:
+                    await session_mgr._db.execute(
+                        "UPDATE sessions SET work_dir = ?, name = ?, last_active = ? WHERE user_id = ? AND opencode_session_id = ?",
+                        (target_path, resumed_title, now_iso, user_id, resumed_session_id)
+                    )
+                else:
+                    await session_mgr._db.execute(
+                        "INSERT INTO sessions (user_id, opencode_session_id, work_dir, name, created_at, last_active, is_active, message_count) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+                        (user_id, resumed_session_id, target_path, resumed_title, now_iso, now_iso)
+                    )
+                await session_mgr._db.commit()
+                
+        except Exception as e:
+            logger.warning(f"Could not scan server sessions during project switch: {e}")
+
+        # Fallback to local DB if server query failed or returned no matches
+        if not resumed_session_id:
+            resumed_session_id = await session_mgr.get_last_session_in_workspace(user_id, target_path)
+
+        if resumed_session_id:
+            # Switch to the existing session
+            await session_mgr.switch_session(user_id, resumed_session_id)
+            
+            # Retrieve the session title/name for nicer feedback
+            session_info = await session_mgr.get_session_info(user_id)
+            name = (session_info or {}).get("name", "") or resumed_title
+            name_text = f" (<i>\"{html.escape(name)}\"</i>)" if name else ""
+
+            await update.message.reply_text(
+                f"🔄 <b>Switched project to:</b> <code>{html.escape(target_folder)}</code>\n"
+                f"✨ <b>Resumed last active conversation</b>{name_text} in this workspace!\n\n"
+                f"📍 <i>Path: {html.escape(target_path)}</i>\n\n"
+                f"Just type your message to continue the discussion.",
+                parse_mode="HTML"
+            )
+        else:
+            # Clear active session so that the next message creates a fresh one in the new folder
+            await session_mgr.clear_session(user_id)
+            await update.message.reply_text(
+                f"🔄 <b>Switched project to:</b> <code>{html.escape(target_folder)}</code>\n"
+                f"🆕 No previous conversation history found here. <b>Prepared a fresh session!</b>\n\n"
+                f"📍 <i>Path: {html.escape(target_path)}</i>\n\n"
+                f"Send your next message to start your new coding conversation.",
+                parse_mode="HTML"
+            )
+        return
+
+    # 6. Show the list of available projects (no arguments provided)
+    lines = [
+        "<b>📁 Project Workspace Root:</b>",
+        f"<code>{html.escape(base_dir)}</code>\n",
+        f"📍 <b>Currently Active Folder:</b>",
+        f"<code>{html.escape(current_dir)}</code>\n",
+        "<b>📂 Available Projects:</b>"
+    ]
+
+    # Always render Option 0 (the root parent workspace itself!)
+    is_root_active = (current_dir == base_dir)
+    root_marker = "🔹" if is_root_active else "🏠"
+    lines.append(f"  0. {root_marker} <code>[Root Workspace Root]</code>")
+
+    if projects:
+        for i, p in enumerate(projects):
+            p_display = p.replace('\\', '/')
+            is_active_marker = "🔹" if os.path.abspath(os.path.join(base_dir, p)) == current_dir else "📁"
+            lines.append(f"  {i+1}. {is_active_marker} <code>{html.escape(p_display)}</code>")
+        
+        lines.append("")
+        lines.append(f"⚙️ <i>Recursive Depth:</i> <code>{user_depth} level(s)</code> (Type <code>/project depth &lt;1-5&gt;</code> to change!)")
+        lines.append("👉 <i>To switch, type:</i> <code>/project &lt;number&gt;</code> or <code>/project &lt;name&gt;</code>")
+    else:
+        lines.append("  <i>(No subdirectories found in the workspace root)</i>")
+        lines.append(f"\n⚙️ <i>Recursive Depth:</i> <code>{user_depth} level(s)</code> (Type <code>/project depth &lt;1-5&gt;</code> to change!)")
+        lines.append("\n💡 <i>Create directories inside your workspace root folder to manage multiple projects!</i>")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+# ──────────────────────────────────────────────
 # Register bot commands for Telegram menu
 # ──────────────────────────────────────────────
 async def set_bot_commands(app) -> None:
@@ -414,6 +865,7 @@ async def set_bot_commands(app) -> None:
         BotCommand("help", "Show all commands"),
         BotCommand("new", "Start a fresh conversation"),
         BotCommand("stop", "Stop/abort the current active task"),
+        BotCommand("project", "View & switch project folders"),
         BotCommand("sessions", "List your sessions"),
         BotCommand("switch", "Switch to another session"),
         BotCommand("model", "Change AI model"),
@@ -423,4 +875,17 @@ async def set_bot_commands(app) -> None:
         BotCommand("status", "Bot & connection status"),
         BotCommand("id", "Show your Telegram user ID"),
     ]
+    # 1. Set default command list globally
     await app.bot.set_my_commands(commands)
+    
+    # 2. Set explicitly for all private chats (ensures visibility in DMs)
+    try:
+        await app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
+    except Exception as e:
+        logger.warning(f"Could not set commands for private chats scope: {e}")
+        
+    # 3. Set explicitly for all group chats (ensures visibility in group discussions)
+    try:
+        await app.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
+    except Exception as e:
+        logger.warning(f"Could not set commands for group chats scope: {e}")

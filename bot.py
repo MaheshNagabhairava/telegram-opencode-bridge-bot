@@ -42,6 +42,7 @@ from handlers.commands import (
     id_command,
     models_command,
     stop_command,
+    project_command,
     set_bot_commands,
 )
 from handlers.messages import handle_message
@@ -109,6 +110,10 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         await stop_command(update, context)
 
     @authorized(authorizer, rate_limiter)
+    async def _project(update, context):
+        await project_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
     async def _message(update, context):
         await handle_message(update, context)
 
@@ -121,6 +126,7 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "model": _model,
         "models": _models,
         "stop": _stop,
+        "project": _project,
         "mode": _mode,
         "share": _share,
         "status": _status,
@@ -225,6 +231,7 @@ def main():
     application.add_handler(CommandHandler("model", handlers["model"], block=False))
     application.add_handler(CommandHandler("models", handlers["models"], block=False))
     application.add_handler(CommandHandler("stop", handlers["stop"], block=False))
+    application.add_handler(CommandHandler("project", handlers["project"], block=False))
     application.add_handler(CommandHandler("mode", handlers["mode"], block=False))
     application.add_handler(CommandHandler("share", handlers["share"], block=False))
     application.add_handler(CommandHandler("status", handlers["status"], block=False))
