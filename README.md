@@ -89,6 +89,8 @@ Open Telegram, find your bot, and start coding! 🎉
 | `/id` | Show your Telegram user ID |
 | `/stop` | Abort active model processing |
 | `/models` | List all available models |
+| `/project` | To view the current workspace, sub folder workspaces and to change the workspace (ex: /project 2)|
+| `/project depth <1to5>` | Depth level recursive check for subfolders (ex: if u give depth 2, only 2 sub folders it will show from root) |
 
 ## 🏗️ Architecture
 
