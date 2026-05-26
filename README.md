@@ -28,7 +28,7 @@ A lightweight Python bot that bridges your Telegram messages directly to [OpenCo
 
 ### Quick Installation:
 ```bash
-pip install telegram-opencode-bridge-bot==0.1.2
+pip install telegram-opencode-bridge-bot==0.1.3
 telegram-opencode-bot
 telegram-opencode-bot --env (use --env flag if u want to re-configure later anytime)
 ```
