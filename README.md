@@ -28,7 +28,7 @@ A lightweight Python bot that bridges your Telegram messages directly to [OpenCo
 
 ### Quick Installation:
 ```bash
-pip install telegram-opencode-bridge-bot==0.1.3
+pip install telegram-opencode-bridge-bot==0.1.4
 telegram-opencode-bot
 telegram-opencode-bot --env (use --env flag if u want to re-configure later anytime)
 ```
@@ -59,17 +59,14 @@ Open Telegram, find your bot, and start asking! 🎉
 | `/start` | Welcome message & connection check |
 | `/help` | Show all commands |
 | `/new` | Start a fresh conversation |
-| `/sessions` | List your recent sessions |
-| `/switch <id>` | Switch to a different session |
-| `/model <name>` | Change AI model(ex: /model opencode/deepseek-v4-flash-free) |
+| `/sessions` | List your recent sessions/conversations and to select a session/conversation |
 | `/mode <plan\|build>` | Toggle plan/build mode |
-| `/share` | Share current session (public URL) |
+| `/share` | Share current session/conversation (public URL) |
 | `/status` | Check connection & session details |
 | `/id` | Show your Telegram user ID |
 | `/stop` | Abort active model processing |
-| `/models` | List all available models |
-| `/project` | To view the current workspace, sub folder workspaces and to change the workspace (ex: /project 2)|
-| `/project depth <1to5>` | Depth level recursive check for subfolders (ex: if u give depth 2, only 2 sub folders it will show from root) |
+| `/models` | List all available providers, models and to select the model |
+| `/project` | To view the current workspace, sub folder workspaces and to change the workspace |
 | `/enable` | To enable the streaming |
 | `/disable` | To disable the streaming |
 

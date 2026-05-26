@@ -24,9 +24,12 @@ from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
+from telegram.request import HTTPXRequest
+from telegram.error import TimedOut, NetworkError
 from utils.formatting import format_error
 
 from config import config
@@ -38,8 +41,6 @@ from handlers.commands import (
     help_command,
     new_command,
     sessions_command,
-    switch_command,
-    model_command,
     mode_command,
     share_command,
     status_command,
@@ -50,6 +51,7 @@ from handlers.commands import (
     enable_command,
     disable_command,
     set_bot_commands,
+    callback_handler,
 )
 from handlers.messages import handle_message
 
@@ -60,6 +62,25 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stderr)],
 )
 logger = logging.getLogger("opencode-telegram-bot")
+
+
+class RetryingHTTPXRequest(HTTPXRequest):
+    """Custom HTTPXRequest that automatically retries failed requests on connection timeouts/errors."""
+    async def do_request(self, *args, **kwargs) -> tuple[int, bytes]:
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return await super().do_request(*args, **kwargs)
+            except (TimedOut, NetworkError) as e:
+                # Do not retry on Pool timeout errors
+                if "Pool timeout" in str(e) or attempt == max_retries - 1:
+                    raise
+                
+                logger.warning(
+                    f"⚠️ Telegram request failed (attempt {attempt + 1}/{max_retries}): {e}. "
+                    f"Retrying in {1.0 * (attempt + 1)}s..."
+                )
+                await asyncio.sleep(1.0 * (attempt + 1))
 
 
 # ── Wrap handlers with auth decorator ──────────────────────
@@ -82,14 +103,6 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
     @authorized(authorizer, rate_limiter)
     async def _sessions(update, context):
         await sessions_command(update, context)
-
-    @authorized(authorizer, rate_limiter)
-    async def _switch(update, context):
-        await switch_command(update, context)
-
-    @authorized(authorizer, rate_limiter)
-    async def _model(update, context):
-        await model_command(update, context)
 
     @authorized(authorizer, rate_limiter)
     async def _mode(update, context):
@@ -127,6 +140,10 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
     async def _disable(update, context):
         await disable_command(update, context)
 
+    @authorized(authorizer)
+    async def _callback(update, context):
+        await callback_handler(update, context)
+
     @authorized(authorizer, rate_limiter)
     async def _message(update, context):
         await handle_message(update, context)
@@ -136,8 +153,6 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "help": _help,
         "new": _new,
         "sessions": _sessions,
-        "switch": _switch,
-        "model": _model,
         "models": _models,
         "stop": _stop,
         "project": _project,
@@ -147,6 +162,7 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "share": _share,
         "status": _status,
         "id": _id,
+        "callback": _callback,
         "message": _message,
     }
 
@@ -390,9 +406,18 @@ def main():
     session_mgr = SessionManager(db_path=config.db_path)
 
     # ── Build Telegram application ────────────────────────
+    request = RetryingHTTPXRequest(
+        connect_timeout=15.0,
+        read_timeout=20.0,
+        write_timeout=20.0,
+        pool_timeout=5.0,
+        connection_pool_size=512,
+    )
+
     application = (
         ApplicationBuilder()
         .token(config.telegram_bot_token)
+        .request(request)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()
@@ -415,8 +440,6 @@ def main():
     application.add_handler(CommandHandler("help", handlers["help"], block=False))
     application.add_handler(CommandHandler("new", handlers["new"], block=False))
     application.add_handler(CommandHandler("sessions", handlers["sessions"], block=False))
-    application.add_handler(CommandHandler("switch", handlers["switch"], block=False))
-    application.add_handler(CommandHandler("model", handlers["model"], block=False))
     application.add_handler(CommandHandler("models", handlers["models"], block=False))
     application.add_handler(CommandHandler("stop", handlers["stop"], block=False))
     application.add_handler(CommandHandler("project", handlers["project"], block=False))
@@ -426,6 +449,9 @@ def main():
     application.add_handler(CommandHandler("share", handlers["share"], block=False))
     application.add_handler(CommandHandler("status", handlers["status"], block=False))
     application.add_handler(CommandHandler("id", handlers["id"], block=False))
+
+    # ── Register callback query handler ───────────────────
+    application.add_handler(CallbackQueryHandler(handlers["callback"], block=False))
 
     # ── Register message handler (catches all text) ───────
     application.add_handler(
@@ -440,7 +466,7 @@ def main():
     logger.info("Starting bot with long polling...")
     application.run_polling(
         drop_pending_updates=True,
-        allowed_updates=["message"],
+        allowed_updates=["message", "callback_query"],
     )
 
 

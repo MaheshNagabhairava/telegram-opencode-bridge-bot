@@ -43,7 +43,7 @@ async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TY
 
     # 3. Server is offline - lazy launch it scoped to the user's active folder
     import html
-    startup_notice = await update.message.reply_text(
+    startup_notice = await update.effective_message.reply_text(
         "⏳ <b>Initializing OpenCode server...</b>\n"
         "This happens once on first startup to physically mount your workspace.",
         parse_mode="HTML"
@@ -53,7 +53,7 @@ async def ensure_server_running(update: Update, context: ContextTypes.DEFAULT_TY
         try:
             await startup_notice.edit_text(text, parse_mode="HTML")
         except Exception:
-            await update.message.reply_text(text, parse_mode="HTML")
+            await update.effective_message.reply_text(text, parse_mode="HTML")
 
     # Resolve last active directory for this user, falling back to default OPENCODE_WORK_DIR
     work_dir = await session_mgr.get_user_work_dir(user_id, config.opencode_work_dir)

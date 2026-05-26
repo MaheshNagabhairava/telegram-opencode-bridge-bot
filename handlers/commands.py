@@ -1,14 +1,15 @@
 """
 Telegram command handlers for the OpenCode bot.
 
-Handles all slash commands: /start, /help, /new, /sessions, /switch,
-/model, /share, /status, /mode.
+Handles all slash commands: /start, /help, /new, /sessions,
+/share, /status, /mode.
 """
 
 import html
 import logging
+import os
 
-from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats
+from telegram import Update, BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
@@ -55,13 +56,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/new — Start a fresh conversation (clears current session)\n"
         "/stop — Stop/abort the current active task\n"
         "/project — View & switch active project directories\n"
-        "/project depth &lt;1-5&gt; — Configure recursive subfolder scan depth\n"
         "/enable — Enable live tool call & progress streaming\n"
         "/disable — Disable live progress streaming\n"
-        "/sessions — List your recent sessions\n"
-        "/switch <code>&lt;id&gt;</code> — Switch to a different session\n"
-        "/model <code>&lt;name&gt;</code> — Change AI model\n"
-        "/models — List all available models\n"
+        "/sessions — List your recent sessions (tap to switch)\n"
+        "/models — List all available models (tap to change)\n"
         "/mode <code>&lt;plan|build&gt;</code> — Toggle plan/build mode\n"
         "/share — Share current session (get public URL)\n"
         "/status — Show bot & connection status\n"
@@ -96,13 +94,7 @@ async def new_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 # Command: /sessions
 # ──────────────────────────────────────────────
 async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List recent sessions for this user in their active workspace.
-
-    Uses the OpenCode server as the source of truth.  Sessions are filtered
-    by matching the server's `directory` field to the user's currently
-    active workspace, exactly like the OpenCode GUI does.
-    """
-    import os
+    """List recent sessions for this user in their active workspace."""
     from utils.formatting import format_session_info
 
     user_id = update.effective_user.id
@@ -127,7 +119,7 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     current_dir_norm = norm(current_dir)
 
-    # -- 1. Fetch ALL sessions from the server ---------
+    # Fetch ALL sessions from the server
     server_sessions = []
     server_session_ids = set()
     try:
@@ -142,7 +134,7 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    # -- 2. Prune local DB: delete any sessions not on the server --
+    # Prune local DB: delete any sessions not on the server
     local_sessions = await session_mgr.list_user_sessions(user_id)
     local_ids = [s.get("session_id") for s in local_sessions]
     stale_ids = [sid for sid in local_ids if sid not in server_session_ids]
@@ -163,7 +155,7 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             if user_id in session_mgr._active_sessions:
                 del session_mgr._active_sessions[user_id]
 
-    # -- 3. Filter server sessions to the current workspace --
+    # Filter server sessions to the current workspace
     workspace_sessions = []
     for s in server_sessions:
         s_dir = s.get("directory", "")
@@ -179,13 +171,12 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
 
-    # -- 4. Build the display list ----------------------
     workspace_sessions.sort(
         key=lambda s: s.get("time", {}).get("updated", 0),
         reverse=True,
     )
 
-    # Lookup locally-tracked data (message counts, model, etc.)
+    # Lookup locally-tracked data
     refreshed_local = await session_mgr.list_user_sessions(user_id)
     local_map = {ls.get("session_id"): ls for ls in refreshed_local}
     active_sid = await session_mgr.get_active_session(user_id)
@@ -230,7 +221,6 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lines.append(format_session_info(display))
         lines.append("")
 
-        # Update local DB title in background
         if s_title and s_id in local_map:
             try:
                 await session_mgr._db.execute(
@@ -241,10 +231,23 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except Exception:
                 pass
 
-    lines.append("\n<i>Use /switch &lt;id&gt; to switch sessions</i>")
+    keyboard = []
+    for s in workspace_sessions:
+        s_id = s.get("id", "")
+        s_title = s.get("title", "") or s_id[:8]
+        is_active = (s_id == active_sid)
+        marker = "🔹" if is_active else "📄"
+        button_text = f"{marker} {s_title}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"sess:{s_id}")])
 
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
+    if keyboard:
+        lines.append("\n👉 <b>Tap a session below to instantly switch to it:</b>")
+    else:
+        lines.append("\n<i>Send a message to start a conversation!</i>")
+
+    await update.message.reply_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
 
 
 # ──────────────────────────────────────────────
@@ -270,8 +273,6 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     target_id = context.args[0].strip()
-    
-    # 1. Resolve short ID prefix to full ID if necessary
     resolved_id = None
     server_sessions = []
     
@@ -285,7 +286,6 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     except Exception as e:
         logger.warning(f"Could not verify session list on server during switch resolution: {e}")
 
-    # Fallback to local DB if server query failed or returned no matches
     if not resolved_id:
         try:
             local_sessions = await session_mgr.list_user_sessions(user_id)
@@ -300,11 +300,9 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not resolved_id:
         resolved_id = target_id
 
-    # 2. Check if the resolved session exists on the server (if server is online)
     if server_sessions:
         server_session_ids = {s.get("id") for s in server_sessions if s.get("id")}
         if resolved_id not in server_session_ids:
-            # Delete it from local DB as it was deleted on the server!
             try:
                 await session_mgr._db.execute(
                     "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
@@ -314,7 +312,6 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except Exception:
                 pass
             
-            # Clean active sessions cache if needed
             if user_id in session_mgr._active_sessions and session_mgr._active_sessions[user_id]["session_id"] == resolved_id:
                 del session_mgr._active_sessions[user_id]
                 
@@ -325,14 +322,11 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             return
 
-    # 3. Switch to the session in local database
     success = await session_mgr.switch_session(user_id, resolved_id)
 
-    # 4. If not found locally but exists on the server, dynamically register it in local DB and switch!
     if not success and server_sessions:
         server_session_ids = {s.get("id") for s in server_sessions if s.get("id")}
         if resolved_id in server_session_ids:
-            # Find the session object
             s_obj = None
             for s in server_sessions:
                 if s.get("id") == resolved_id:
@@ -346,7 +340,6 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 from datetime import datetime
                 now_iso = datetime.utcnow().isoformat()
                 
-                # Insert into local DB
                 try:
                     await session_mgr._db.execute(
                         "INSERT INTO sessions (user_id, opencode_session_id, work_dir, name, created_at, last_active, is_active, message_count) "
@@ -354,7 +347,6 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         (user_id, resolved_id, s_dir, s_title, now_iso, now_iso)
                     )
                     await session_mgr._db.commit()
-                    # Switch again
                     success = await session_mgr.switch_session(user_id, resolved_id)
                 except Exception:
                     pass
@@ -370,41 +362,6 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             f"Use /sessions to see your sessions.",
             parse_mode="HTML",
         )
-
-
-# ──────────────────────────────────────────────
-# Command: /model <model_name>
-# ──────────────────────────────────────────────
-async def model_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Change the AI model for the current session."""
-    user_id = update.effective_user.id
-    session_mgr = context.bot_data["session_manager"]
-    config = context.bot_data["config"]
-
-    if not context.args:
-        current_info = await session_mgr.get_session_info(user_id)
-        current_model = (current_info or {}).get("model", config.opencode_model) or config.opencode_model
-
-        await update.message.reply_text(
-            f"🤖 <b>Current model:</b> <code>{html.escape(current_model)}</code>\n\n"
-            f"<b>Usage:</b> /model <code>&lt;provider/model&gt;</code>\n\n"
-            f"<b>Examples:</b>\n"
-            f"  /model anthropic/claude-sonnet-4\n"
-            f"  /model google/gemini-2.5-pro\n"
-            f"  /model openai/gpt-4o\n"
-            f"  /model ollama/llama3",
-            parse_mode="HTML",
-        )
-        return
-
-    new_model = " ".join(context.args)
-    await session_mgr.set_model(user_id, new_model)
-
-    await update.message.reply_text(
-        f"✅ Model changed to <code>{html.escape(new_model)}</code>\n\n"
-        f"<i>This applies to your current session.</i>",
-        parse_mode="HTML",
-    )
 
 
 # ──────────────────────────────────────────────
@@ -506,7 +463,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # Command: /id
 # ──────────────────────────────────────────────
 async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show the user's Telegram ID (useful for adding to AUTHORIZED_USERS)."""
+    """Show the user's Telegram ID."""
     user = update.effective_user
     await update.message.reply_text(
         f"👤 <b>Your Telegram User ID:</b>\n<code>{user.id}</code>\n\n"
@@ -519,7 +476,7 @@ async def id_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # Command: /models
 # ──────────────────────────────────────────────
 async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List all available (connected/active) models on the OpenCode server."""
+    """List all available models on the OpenCode server."""
     user_id = update.effective_user.id
     bot_data = context.bot_data
     oc_client = bot_data["opencode_client"]
@@ -540,40 +497,45 @@ async def models_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await update.message.reply_text("📭 No models found on the server.", parse_mode="HTML")
             return
 
-        lines = ["<b>🤖 Available Models on OpenCode</b>\n"]
-        connected_count = 0
-        
+        connected_lower = {c.lower() for c in connected if c}
+
+        lines = [
+            "<b>🤖 Choose AI Model Provider</b>\n",
+            "Select an active connected provider below to view and switch models for your current session:"
+        ]
+
+        # Provider-to-emoji mapping for high visual contrast and distinct colors
+        provider_emojis = {
+            "anthropic": "🟧",
+            "openai": "🟩",
+            "google": "🔵",
+            "ollama": "🟪",
+            "chutes": "🟥",
+            "opencode": "🟡",
+        }
+
+        keyboard = []
         for p in all_providers:
-            p_id = p.get("id")
-            # Only display models for connected/active providers (e.g. opencode free models, or ones with active API keys like chutes)
-            if p_id not in connected:
+            p_id = p.get("id", "")
+            p_id_lower = p_id.lower() if p_id else ""
+            if p_id_lower not in connected_lower:
                 continue
-                
-            p_name = p.get("name", p_id)
             models = p.get("models", {})
-            
             if not models:
                 continue
-                
-            connected_count += 1
-            lines.append(f"🔌 <b>{html.escape(p_name)}</b> (<code>{html.escape(p_id)}</code>):")
-            for m_id, m in models.items():
-                m_name = m.get("name", m_id)
-                # Provider programmatic path is providerID/modelID
-                path = f"{p_id}/{m_id}"
-                lines.append(f"  • {html.escape(m_name)}\n    → <code>/model {html.escape(path)}</code>")
-            lines.append("")
+            
+            p_name = p.get("name", p_id)
+            emoji = provider_emojis.get(p_id_lower, "⚪")
+            keyboard.append([InlineKeyboardButton(f"───【 {emoji} {p_name.upper()} 】───", callback_data=f"prov:{p_id}")])
 
-        if connected_count == 0:
-            lines.append("<i>No active/connected providers found.</i>\n")
-
-        lines.append("💡 <b>Tip:</b> To enable additional providers (like <code>chutes</code>, <code>openai</code>, <code>anthropic</code>, etc.), configure their respective API keys in your environment or on the OpenCode server.")
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
 
         response_text = "\n".join(lines)
         from utils.formatting import split_message
         chunks = split_message(response_text, 4000)
-        for chunk in chunks:
-            await update.message.reply_text(chunk, parse_mode="HTML")
+        for i, chunk in enumerate(chunks):
+            markup = reply_markup if i == len(chunks) - 1 else None
+            await update.message.reply_text(chunk, reply_markup=markup, parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"Failed to fetch models: {e}", exc_info=True)
@@ -618,195 +580,166 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 # ──────────────────────────────────────────────
-# Command: /project
+# Command: /project dynamic explorer helpers & commands
 # ──────────────────────────────────────────────
-async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """List project directories or switch to one by number or name."""
+
+def get_subdirectories(parent_dir: str) -> list[str]:
     import os
-    user_id = update.effective_user.id
-    session_mgr = context.bot_data["session_manager"]
-    config = context.bot_data["config"]
-    oc_client = context.bot_data["opencode_client"]
-
-    def norm(p):
-        if not p:
-            return ""
-        return os.path.normcase(os.path.normpath(os.path.abspath(p)))
-
-    # 1. Base directory is the workspace parent folder configured in .env
-    base_dir = os.path.abspath(config.opencode_work_dir)
-    
-    # 2. Get user's current working directory and scan settings
-    current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
-    current_dir = os.path.abspath(current_dir)
-    
-    user_depth = await session_mgr.get_user_scan_depth(user_id, config.project_scan_depth)
-
-    # 3. Check if the user is changing the scan depth setting
-    if context.args and context.args[0].lower() in ("depth", "level", "levels"):
-        if len(context.args) > 1 and context.args[1].isdigit():
-            new_depth = int(context.args[1])
-            if 1 <= new_depth <= 5: # Limit depth between 1 and 5 for safety and speed
-                await session_mgr.set_user_scan_depth(user_id, new_depth)
-                await update.message.reply_text(
-                    f"⚙️ <b>Scan depth updated successfully!</b>\n"
-                    f"Projects will now be scanned up to <b>{new_depth}</b> level(s) deep inside your parent workspace.\n\n"
-                    f"Type /project to see the updated list!",
-                    parse_mode="HTML"
-                )
-                return
-            else:
-                await update.message.reply_text(
-                    "⚠️ Invalid depth level. Please choose a depth level between 1 and 5.",
-                    parse_mode="HTML"
-                )
-                return
-        else:
-            await update.message.reply_text(
-                "⚠️ Usage: <code>/project depth &lt;number&gt;</code>\n"
-                "Example: <code>/project depth 2</code> (scans up to 2 levels deep)",
-                parse_mode="HTML"
-            )
-            return
-
-    # 4. Pruned recursive scanning function to list project subfolders
-    def scan_projects_recursive(current_dir, parent_dir, max_depth=3, current_depth=1):
-        if current_depth > max_depth:
-            return []
-        
-        ignore_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules", ".gemini", ".idea", ".vscode", "build", "dist", ".next"}
-        found_projects = []
-        try:
-            for name in sorted(os.listdir(current_dir)):
+    ignore_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules", ".gemini", ".idea", ".vscode", "build", "dist", ".next"}
+    subdirs = []
+    try:
+        if os.path.exists(parent_dir) and os.path.isdir(parent_dir):
+            for name in sorted(os.listdir(parent_dir)):
                 if name.startswith(".") or name in ignore_dirs:
                     continue
-                full_path = os.path.join(current_dir, name)
-                if os.path.isdir(full_path):
-                    # Relpath from parent_dir
-                    rel_path = os.path.relpath(full_path, parent_dir)
-                    found_projects.append(rel_path)
-                    # Recurse down
-                    found_projects.extend(scan_projects_recursive(full_path, parent_dir, max_depth, current_depth + 1))
+                if os.path.isdir(os.path.join(parent_dir, name)):
+                    subdirs.append(name)
+    except Exception:
+        pass
+    return subdirs
+
+
+def render_project_explorer(browsing_dir: str, base_dir: str, current_active_dir: str) -> tuple[str, InlineKeyboardMarkup]:
+    import os
+    import html
+    
+    subdirs = get_subdirectories(browsing_dir)
+    
+    # Normalize paths for clean display
+    norm_base = os.path.normpath(base_dir)
+    norm_browsing = os.path.normpath(browsing_dir)
+    norm_active = os.path.normpath(current_active_dir)
+    
+    # Determine relation to base_dir
+    rel_path = os.path.relpath(norm_browsing, norm_base)
+    display_rel = "Root" if rel_path == "." else rel_path.replace('\\', '/')
+    
+    lines = [
+        "<b>📁 Workspace File Explorer</b>\n",
+        f"🏠 <b>Workspace Root Parent:</b>",
+        f"<code>{html.escape(norm_base)}</code>\n",
+        f"🔍 <b>Currently Browsing:</b>",
+        f"<code>{html.escape(display_rel)}</code>",
+        f"<pre>{html.escape(norm_browsing)}</pre>\n",
+        f"📍 <b>Currently Active Workspace:</b>",
+        f"<code>{html.escape(os.path.basename(norm_active) or 'Root')}</code>",
+        f"<pre>{html.escape(norm_active)}</pre>\n",
+        "ℹ️ <i>Explore subfolders below. Tap <b>SELECT THIS WORKSPACE</b> to set the currently browsing folder as your active environment.</i>"
+    ]
+    
+    # Build inline keyboard
+    keyboard = []
+    
+    # Control row: Parent Folder (if not at base_dir root) and Select Workspace
+    control_row = []
+    
+    is_at_root = (os.path.normcase(norm_browsing) == os.path.normcase(norm_base))
+    if not is_at_root:
+        control_row.append(InlineKeyboardButton("⬅️ Parent Folder", callback_data="proj_nav:parent"))
+        
+    control_row.append(InlineKeyboardButton("✅ SELECT THIS WORKSPACE", callback_data="proj_nav:select"))
+    keyboard.append(control_row)
+    
+    # Subdirectories
+    if subdirs:
+        subdir_buttons = []
+        for idx, name in enumerate(subdirs):
+            subdir_buttons.append(InlineKeyboardButton(f"📁 {name}/", callback_data=f"proj_nav:sub:{idx}"))
+        
+        for j in range(0, len(subdir_buttons), 2):
+            keyboard.append(subdir_buttons[j:j+2])
+    else:
+        lines.append("\n📭 <i>(No subdirectories inside this folder)</i>")
+        
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    return "\n".join(lines), reply_markup
+
+
+async def execute_project_switch(update_or_query, context: ContextTypes.DEFAULT_TYPE, user_id: int, target_path: str) -> None:
+    """Helper to perform the actual project switch, server restart, and session creation."""
+    import os
+    import html
+    session_mgr = context.bot_data["session_manager"]
+    oc_client = context.bot_data["opencode_client"]
+    config = context.bot_data["config"]
+
+    # Save to database
+    await session_mgr.set_user_work_dir(user_id, target_path)
+    
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    target_folder = os.path.relpath(target_path, base_dir)
+    if target_folder == ".":
+        target_folder = "[Root] " + os.path.basename(base_dir)
+    else:
+        target_folder = target_folder.replace('\\', '/')
+
+    # Inform user/edit message
+    status_text = (
+        f"⏳ <b>Switching project to:</b> <code>{html.escape(target_folder)}</code>...\n"
+        f"Restarting OpenCode serve backend to physically isolate execution environment..."
+    )
+    
+    is_query = hasattr(update_or_query, "edit_message_text")
+    if is_query:
+        status_msg = await update_or_query.edit_message_text(status_text, parse_mode="HTML")
+    else:
+        status_msg = await update_or_query.message.reply_text(status_text, parse_mode="HTML")
+
+    async def update_status(text):
+        try:
+            await status_msg.edit_text(text, parse_mode="HTML")
         except Exception:
-            pass
-        return found_projects
+            if is_query:
+                await update_or_query.message.reply_text(text, parse_mode="HTML")
+            else:
+                await update_or_query.reply_text(text, parse_mode="HTML")
 
+    from urllib.parse import urlparse
     try:
-        if not os.path.exists(base_dir) or not os.path.isdir(base_dir):
-            await update.message.reply_text(
-                f"❌ <b>Workspace directory does not exist:</b>\n<code>{html.escape(base_dir)}</code>",
-                parse_mode="HTML"
-            )
-            return
+        url_parsed = urlparse(config.opencode_server_url)
+        hostname = url_parsed.hostname or "127.0.0.1"
+        port = url_parsed.port or 8080
+    except Exception:
+        hostname = "127.0.0.1"
+        port = 8080
 
-        # Scan subfolders recursively (up to user-configured depth)
-        projects = scan_projects_recursive(base_dir, base_dir, max_depth=user_depth)
-    except Exception as e:
-        logger.error(f"Failed to scan workspace directory {base_dir}: {e}", exc_info=True)
-        await update.message.reply_text(
-            f"❌ <b>Error scanning projects folder:</b>\n<code>{html.escape(str(e))}</code>",
-            parse_mode="HTML"
+    from opencode.server import restart_server
+    restart_success = await restart_server(target_path, port=port, hostname=hostname)
+
+    if not restart_success:
+        await update_status(
+            f"❌ <b>Failed to restart OpenCode server inside the new project directory.</b>\n\n"
+            f"📍 <i>Target Path: {html.escape(target_path)}</i>\n\n"
+            f"Please ensure <code>opencode serve</code> can run on port {port} or check bot logs.",
         )
         return
 
-    # 5. Check if we received an argument to switch
-    if context.args:
-        arg = " ".join(context.args).strip()
-        target_folder = None
-        target_path = None
+    context.bot_data["server_started"] = True
 
-        # Check if the user specified the root workspace (0, 'root', or the base dir name)
-        base_name = os.path.basename(base_dir)
-        if arg == "0" or arg.lower() in ("root", "root workspace", "root workspace root", base_name.lower()):
-            target_folder = f"[Root] {base_name}"
-            target_path = base_dir
-        # Check if the argument is a valid absolute path on the system
-        elif os.path.isabs(arg) and os.path.isdir(arg):
-            target_path = os.path.abspath(arg)
-            target_folder = os.path.basename(target_path) or "Root"
-        # Check if argument is a number from the projects list
-        elif arg.isdigit():
-            idx = int(arg) - 1
-            if 0 <= idx < len(projects):
-                target_folder = projects[idx].replace('\\', '/')
-                target_path = os.path.abspath(os.path.join(base_dir, projects[idx]))
-            else:
-                await update.message.reply_text(
-                    f"⚠️ Invalid project number. Choose a number between 1 and {len(projects)}, or 0 for Root Workspace.",
-                    parse_mode="HTML"
-                )
-                return
-        else:
-            # Case-insensitive name match inside subfolders (checks full relative path or leaf folder name)
-            for p in projects:
-                folder_name = os.path.basename(p)
-                p_display = p.replace('\\', '/')
-                if p.lower() == arg.lower() or p_display.lower() == arg.lower() or folder_name.lower() == arg.lower():
-                    target_folder = p_display
-                    target_path = os.path.abspath(os.path.join(base_dir, p))
-                    break
-            
-            # If no exact name match, try a partial match inside subfolders
-            if not target_path:
-                for p in projects:
-                    folder_name = os.path.basename(p)
-                    p_display = p.replace('\\', '/')
-                    if arg.lower() in p.lower() or arg.lower() in folder_name.lower():
-                        target_folder = p_display
-                        target_path = os.path.abspath(os.path.join(base_dir, p))
-                        break
+    # Check if there is an existing last active session for this workspace
+    last_sess_id = await session_mgr.get_last_session_in_workspace(user_id, target_path)
+    resumed = False
 
-        if not target_path:
-            await update.message.reply_text(
-                f"⚠️ Project folder <code>{html.escape(arg)}</code> not found inside your workspace directory.\n\n"
-                f"Type /project to see the list of available projects.",
-                parse_mode="HTML"
-            )
-            return
-
-        # Save to database
-        await session_mgr.set_user_work_dir(user_id, target_path)
-
-        # 6. Dynamic Restart & Isolation Logic:
-        # Inform the user that we are switching the project and restarting the OpenCode server to mount the directory.
-        status_msg = await update.message.reply_text(
-            f"⏳ <b>Switching project to:</b> <code>{html.escape(target_folder)}</code>...\n"
-            f"Restarting OpenCode serve backend to physically isolate execution environment...",
-            parse_mode="HTML"
-        )
-
-        async def update_status(text):
-            try:
-                await status_msg.edit_text(text, parse_mode="HTML")
-            except Exception:
-                await update.message.reply_text(text, parse_mode="HTML")
-
-        from urllib.parse import urlparse
+    if last_sess_id:
         try:
-            url_parsed = urlparse(config.opencode_server_url)
-            hostname = url_parsed.hostname or "127.0.0.1"
-            port = url_parsed.port or 8080
-        except Exception:
-            hostname = "127.0.0.1"
-            port = 8080
+            # Query server to verify the session still exists there
+            server_sessions = await oc_client.list_sessions()
+            server_session_ids = {s.get("id") for s in server_sessions if s.get("id")}
+            if last_sess_id in server_session_ids:
+                await session_mgr.switch_session(user_id, last_sess_id)
+                resumed = True
+                await update_status(
+                    f"🔄 <b>Switched project to:</b> <code>{html.escape(target_folder)}</code>\n"
+                    f"🚀 <b>OpenCode server restarted & last session resumed!</b>\n\n"
+                    f"📍 <i>Path: {html.escape(target_path)}</i>\n"
+                    f"🆔 <i>Session ID: {html.escape(last_sess_id[:8])}</i>\n\n"
+                    f"Resumed previous workspace conversation. Send your next message to continue coding!",
+                )
+        except Exception as e:
+            logger.warning(f"Failed to verify and switch to last active session: {e}")
 
-        from opencode.server import restart_server
-        restart_success = await restart_server(target_path, port=port, hostname=hostname)
-
-        if not restart_success:
-            await update_status(
-                f"❌ <b>Failed to restart OpenCode server inside the new project directory.</b>\n\n"
-                f"📍 <i>Target Path: {html.escape(target_path)}</i>\n\n"
-                f"Please ensure <code>opencode serve</code> can run on port {port} or check bot logs.",
-            )
-            return
-
-        context.bot_data["server_started"] = True
-
-        # Clear the old session from SQLite and active cache
+    if not resumed:
         await session_mgr.clear_session(user_id)
-
-        # Create a fresh session inside the restarted backend scoped to the target directory
         try:
             result = await oc_client.create_session(directory=target_path)
             if not isinstance(result, dict):
@@ -836,37 +769,65 @@ async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 f"📍 <i>Path: {html.escape(target_path)}</i>\n\n"
                 f"Try sending a message; the bot will attempt to auto-heal and create a new session.",
             )
+
+
+async def project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List project directories or switch to one by number or name."""
+    import os
+    import html
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    config = context.bot_data["config"]
+
+    # Base directory is the workspace parent folder configured in .env
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    
+    current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+    current_dir = os.path.abspath(current_dir)
+
+    # Check for manual switch
+    if context.args:
+        arg = " ".join(context.args).strip()
+        target_path = None
+        
+        base_name = os.path.basename(base_dir)
+        if arg == "0" or arg.lower() in ("root", "root workspace", "root workspace root", base_name.lower()):
+            target_path = base_dir
+        elif os.path.isabs(arg) and os.path.isdir(arg):
+            target_path = os.path.abspath(arg)
+        else:
+            def find_dir_recursive(parent, target_name):
+                ignore_dirs = {".git", ".venv", "venv", "__pycache__", "node_modules", ".gemini", ".idea", ".vscode", "build", "dist", ".next"}
+                try:
+                    for name in os.listdir(parent):
+                        if name.startswith(".") or name in ignore_dirs:
+                            continue
+                        full_path = os.path.join(parent, name)
+                        if os.path.isdir(full_path):
+                            if name.lower() == target_name.lower():
+                                return full_path
+                            found = find_dir_recursive(full_path, target_name)
+                            if found:
+                                return found
+                except Exception:
+                    pass
+                return None
+            target_path = find_dir_recursive(base_dir, arg)
+
+        if not target_path:
+            await update.message.reply_text(
+                f"⚠️ Project folder <code>{html.escape(arg)}</code> not found inside your workspace directory.\n\n"
+                f"Type /project to see the file explorer.",
+                parse_mode="HTML"
+            )
+            return
+
+        await execute_project_switch(update, context, user_id, target_path)
         return
 
-    # 6. Show the list of available projects (no arguments provided)
-    lines = [
-        "<b>📁 Project Workspace Root:</b>",
-        f"<code>{html.escape(base_dir)}</code>\n",
-        f"📍 <b>Currently Active Folder:</b>",
-        f"<code>{html.escape(current_dir)}</code>\n",
-        "<b>📂 Available Projects:</b>"
-    ]
-
-    # Always render Option 0 (the root parent workspace itself!)
-    is_root_active = (current_dir == base_dir)
-    root_marker = "🔹" if is_root_active else "🏠"
-    lines.append(f"  0. {root_marker} <code>[Root Workspace Root]</code>")
-
-    if projects:
-        for i, p in enumerate(projects):
-            p_display = p.replace('\\', '/')
-            is_active_marker = "🔹" if os.path.abspath(os.path.join(base_dir, p)) == current_dir else "📁"
-            lines.append(f"  {i+1}. {is_active_marker} <code>{html.escape(p_display)}</code>")
-        
-        lines.append("")
-        lines.append(f"⚙️ <i>Recursive Depth:</i> <code>{user_depth} level(s)</code> (Type <code>/project depth &lt;1-5&gt;</code> to change!)")
-        lines.append("👉 <i>To switch, type:</i> <code>/project &lt;number&gt;</code> or <code>/project &lt;name&gt;</code>")
-    else:
-        lines.append("  <i>(No subdirectories found in the workspace root)</i>")
-        lines.append(f"\n⚙️ <i>Recursive Depth:</i> <code>{user_depth} level(s)</code> (Type <code>/project depth &lt;1-5&gt;</code> to change!)")
-        lines.append("\n💡 <i>Create directories inside your workspace root folder to manage multiple projects!</i>")
-
-    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    context.user_data["browsing_dir"] = current_dir
+    text, reply_markup = render_project_explorer(current_dir, base_dir, current_dir)
+    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
 
 # ──────────────────────────────────────────────
@@ -919,25 +880,281 @@ async def set_bot_commands(app) -> None:
         BotCommand("enable", "Enable live progress streaming"),
         BotCommand("disable", "Disable live progress streaming"),
         BotCommand("sessions", "List your sessions"),
-        BotCommand("switch", "Switch to another session"),
-        BotCommand("model", "Change AI model"),
         BotCommand("models", "List all available models"),
         BotCommand("mode", "Toggle plan/build mode"),
         BotCommand("share", "Share current session"),
         BotCommand("status", "Bot & connection status"),
         BotCommand("id", "Show your Telegram user ID"),
     ]
-    # 1. Set default command list globally
     await app.bot.set_my_commands(commands)
     
-    # 2. Set explicitly for all private chats (ensures visibility in DMs)
     try:
         await app.bot.set_my_commands(commands, scope=BotCommandScopeAllPrivateChats())
     except Exception as e:
         logger.warning(f"Could not set commands for private chats scope: {e}")
         
-    # 3. Set explicitly for all group chats (ensures visibility in group discussions)
     try:
         await app.bot.set_my_commands(commands, scope=BotCommandScopeAllGroupChats())
     except Exception as e:
         logger.warning(f"Could not set commands for group chats scope: {e}")
+
+
+# ──────────────────────────────────────────────
+# Central Callback Query Handler
+# ──────────────────────────────────────────────
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Centralized handler for all inline button tap actions (projects, sessions, models)."""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = update.effective_user.id
+    data = query.data
+    bot_data = context.bot_data
+    session_mgr = bot_data["session_manager"]
+    oc_client = bot_data["opencode_client"]
+    config = bot_data["config"]
+
+    if not data or data == "noop":
+        return
+
+    import os
+    logger.info(f"Callback query received from user {user_id}: {data}")
+
+    # 1. Switch Session tap
+    if data.startswith("sess:"):
+        target_id = data[len("sess:"):]
+        
+        from handlers.messages import ensure_server_running
+        if not await ensure_server_running(update, context, user_id):
+            return
+
+        resolved_id = None
+        server_sessions = []
+        try:
+            server_sessions = await oc_client.list_sessions()
+            for s in server_sessions:
+                s_id = s.get("id", "")
+                if s_id.lower().startswith(target_id.lower()):
+                    resolved_id = s_id
+                    break
+        except Exception as e:
+            logger.warning(f"Could not verify session list on server during callback: {e}")
+
+        if not resolved_id:
+            try:
+                local_sessions = await session_mgr.list_user_sessions(user_id)
+                for s in local_sessions:
+                    s_id = s.get("session_id", "")
+                    if s_id.lower().startswith(target_id.lower()):
+                        resolved_id = s_id
+                        break
+            except Exception as e:
+                logger.warning(f"Could not fetch local sessions during callback: {e}")
+
+        if not resolved_id:
+            resolved_id = target_id
+
+        if server_sessions:
+            server_session_ids = {s.get("id") for s in server_sessions if s.get("id")}
+            if resolved_id not in server_session_ids:
+                try:
+                    await session_mgr._db.execute(
+                        "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
+                        (user_id, resolved_id)
+                    )
+                    await session_mgr._db.commit()
+                except Exception:
+                    pass
+                
+                if user_id in session_mgr._active_sessions and session_mgr._active_sessions[user_id]["session_id"] == resolved_id:
+                    del session_mgr._active_sessions[user_id]
+                    
+                await query.edit_message_text(
+                    f"❌ Session <code>{html.escape(resolved_id[:8])}</code> has been deleted on the server.",
+                    parse_mode="HTML",
+                )
+                return
+
+        success = await session_mgr.switch_session(user_id, resolved_id)
+
+        if not success and server_sessions:
+            server_session_ids = {s.get("id") for s in server_sessions if s.get("id")}
+            if resolved_id in server_session_ids:
+                s_obj = None
+                for s in server_sessions:
+                    if s.get("id") == resolved_id:
+                        s_obj = s
+                        break
+                
+                if s_obj:
+                    s_dir = s_obj.get("directory", "")
+                    s_title = s_obj.get("title", "")
+                    from datetime import datetime
+                    now_iso = datetime.utcnow().isoformat()
+                    try:
+                        await session_mgr._db.execute(
+                            "INSERT INTO sessions (user_id, opencode_session_id, work_dir, name, created_at, last_active, is_active, message_count) "
+                            "VALUES (?, ?, ?, ?, ?, ?, 0, 0)",
+                            (user_id, resolved_id, s_dir, s_title, now_iso, now_iso)
+                        )
+                        await session_mgr._db.commit()
+                        success = await session_mgr.switch_session(user_id, resolved_id)
+                    except Exception:
+                        pass
+
+        if success:
+            await query.edit_message_text(
+                f"✅ Switched to session <code>{html.escape(resolved_id[:8])}</code>",
+                parse_mode="HTML",
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ Session <code>{html.escape(resolved_id[:8])}</code> not found.",
+                parse_mode="HTML",
+            )
+
+    # 2. Switch Model tap
+    elif data.startswith("model:"):
+        new_model = data[len("model:"):]
+        await session_mgr.set_model(user_id, new_model)
+        await query.edit_message_text(
+            f"✅ Model changed to <code>{html.escape(new_model)}</code>\n\n"
+            f"<i>This applies to your current session.</i>",
+            parse_mode="HTML",
+        )
+
+    # 2.5 Drill Down Provider Tapped
+    elif data.startswith("prov:"):
+        provider_id = data[len("prov:"):]
+        
+        provider_emojis = {
+            "anthropic": "🟧",
+            "openai": "🟩",
+            "google": "🔵",
+            "ollama": "🟪",
+            "chutes": "🟥",
+            "opencode": "🟡",
+        }
+
+        try:
+            models_data = await oc_client.get_available_models()
+            all_providers = models_data.get("all", [])
+            connected = models_data.get("connected", [])
+            
+            target_provider = None
+            for p in all_providers:
+                p_id = p.get("id", "")
+                if p_id.lower() == provider_id.lower():
+                    target_provider = p
+                    break
+            
+            if not target_provider:
+                await query.edit_message_text("❌ No models found for this provider on the server.")
+                return
+                
+            p_id = target_provider.get("id", "")
+            p_name = target_provider.get("name", p_id)
+            emoji = provider_emojis.get(p_id.lower(), "⚪")
+            models = target_provider.get("models", {})
+            
+            sub_keyboard = []
+            sub_keyboard.append([InlineKeyboardButton(f"───【 {emoji} {p_name.upper()} MODELS 】───", callback_data="noop")])
+            
+            model_buttons = []
+            for m_id, m in models.items():
+                m_name = m.get("name", m_id)
+                path = f"{p_id}/{m_id}"
+                
+                display_name = m_name[:15] + "..." if len(m_name) > 18 else m_name
+                model_buttons.append(InlineKeyboardButton(f"🤖 {display_name}", callback_data=f"model:{path}"))
+            
+            for j in range(0, len(model_buttons), 2):
+                sub_keyboard.append(model_buttons[j:j+2])
+                
+            sub_keyboard.append([InlineKeyboardButton(f"« ⬅️ Back to Providers", callback_data="prov_back")])
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(sub_keyboard))
+            
+        except Exception as e:
+            logger.error(f"Failed to drill down to provider {provider_id}: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ Failed to query models for {provider_id}: {e}")
+
+    # 2.6 Back to Provider Menu Tapped
+    elif data == "prov_back":
+        provider_emojis = {
+            "anthropic": "🟧",
+            "openai": "🟩",
+            "google": "🔵",
+            "ollama": "🟪",
+            "chutes": "🟥",
+            "opencode": "🟡",
+        }
+
+        try:
+            models_data = await oc_client.get_available_models()
+            all_providers = models_data.get("all", [])
+            connected = models_data.get("connected", [])
+            connected_lower = {c.lower() for c in connected if c}
+            
+            main_keyboard = []
+            for p in all_providers:
+                p_id = p.get("id", "")
+                p_id_lower = p_id.lower() if p_id else ""
+                if p_id_lower not in connected_lower:
+                    continue
+                models = p.get("models", {})
+                if not models:
+                    continue
+                
+                p_name = p.get("name", p_id)
+                emoji = provider_emojis.get(p_id_lower, "⚪")
+                main_keyboard.append([InlineKeyboardButton(f"───【 {emoji} {p_name.upper()} 】───", callback_data=f"prov:{p_id}")])
+                
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(main_keyboard))
+            
+        except Exception as e:
+            logger.error(f"Failed to return to main provider menu: {e}", exc_info=True)
+            await query.edit_message_text(f"❌ Failed to load main provider menu: {e}")
+
+    # 3. Dynamic File Explorer Navigation
+    elif data.startswith("proj_nav:"):
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        browsing_dir = context.user_data.get("browsing_dir")
+        if not browsing_dir:
+            browsing_dir = current_dir
+            context.user_data["browsing_dir"] = browsing_dir
+            
+        browsing_dir = os.path.abspath(browsing_dir)
+        action = data[len("proj_nav:"):]
+        
+        if action == "parent":
+            parent_dir = os.path.abspath(os.path.dirname(browsing_dir))
+            if os.path.normcase(browsing_dir) != os.path.normcase(base_dir):
+                if os.path.normcase(parent_dir).startswith(os.path.normcase(base_dir)):
+                    browsing_dir = parent_dir
+                    context.user_data["browsing_dir"] = browsing_dir
+            
+            text, reply_markup = render_project_explorer(browsing_dir, base_dir, current_dir)
+            await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+            
+        elif action == "select":
+            await execute_project_switch(query, context, user_id, browsing_dir)
+            
+        elif action.startswith("sub:"):
+            try:
+                sub_idx = int(action[len("sub:"):])
+                subdirs = get_subdirectories(browsing_dir)
+                if 0 <= sub_idx < len(subdirs):
+                    target_dir = os.path.abspath(os.path.join(browsing_dir, subdirs[sub_idx]))
+                    if os.path.normcase(target_dir).startswith(os.path.normcase(base_dir)):
+                        browsing_dir = target_dir
+                        context.user_data["browsing_dir"] = browsing_dir
+                
+                text, reply_markup = render_project_explorer(browsing_dir, base_dir, current_dir)
+                await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
+            except Exception as e:
+                logger.error(f"Error navigating subfolder: {e}", exc_info=True)
+                await query.edit_message_text(f"❌ Navigation error: {e}")
+
