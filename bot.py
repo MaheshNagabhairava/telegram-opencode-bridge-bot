@@ -212,8 +212,26 @@ def run_firstrun_setup():
     print("=" * 60)
     print("This utility will help you configure your .env file.\n")
     
-    # 1. Read existing .env values if they exist, to provide defaults
+    # 1. Read existing .env.example values for base defaults, then override with .env if it exists
     current_values = {}
+    
+    # Read .env.example first
+    if os.path.exists(".env.example"):
+        try:
+            with open(".env.example", "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        # Strip quotes if present
+                        v = v.strip().strip("'\"")
+                        # Skip placeholder token/IDs
+                        if not v.startswith("your_") and v != "123456789,987654321":
+                            current_values[k.strip()] = v
+        except Exception:
+            pass
+
+    # Override with actual .env values if they exist
     if os.path.exists(".env"):
         try:
             with open(".env", "r", encoding="utf-8") as f:
@@ -278,7 +296,7 @@ def run_firstrun_setup():
     model = ask(
         "OPENCODE_MODEL", 
         "6. Enter OPENCODE_MODEL", 
-        "opencode/deepseek-v4-flash-free"
+        "anthropic/claude-sonnet-4"
     )
     
     work_dir = ask(
