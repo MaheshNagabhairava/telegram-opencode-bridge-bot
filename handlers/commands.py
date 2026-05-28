@@ -60,7 +60,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/disable — Disable live progress streaming\n"
         "/sessions — List your recent sessions (tap to switch)\n"
         "/models — List all available models (tap to change)\n"
-        "/mode <code>&lt;plan|build&gt;</code> — Toggle plan/build mode\n"
+        "/plan — Switch to plan mode (read-only)\n"
+        "/build — Switch to build mode (read, write, execute)\n"
         "/share — Share current session (get public URL)\n"
         "/status — Show bot & connection status\n"
         "/id — Show your Telegram user ID\n\n"
@@ -365,39 +366,28 @@ async def switch_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 # ──────────────────────────────────────────────
-# Command: /mode <plan|build>
+# Commands: /plan and /build
 # ──────────────────────────────────────────────
-async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Switch between plan and build mode."""
+async def plan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch the current session to plan mode (read-only)."""
     user_id = update.effective_user.id
     session_mgr = context.bot_data["session_manager"]
-
-    if not context.args:
-        current_info = await session_mgr.get_session_info(user_id)
-        current_mode = (current_info or {}).get("mode", "build")
-
-        await update.message.reply_text(
-            f"⚙️ <b>Current mode:</b> {current_mode}\n\n"
-            f"<b>Usage:</b> /mode <code>&lt;plan|build&gt;</code>\n\n"
-            f"• <b>build</b> — OpenCode can read, write, and execute\n"
-            f"• <b>plan</b> — Read-only analysis, no file modifications",
-            parse_mode="HTML",
-        )
-        return
-
-    mode = context.args[0].lower()
-    if mode not in ("plan", "build"):
-        await update.message.reply_text(
-            "❌ Invalid mode. Use <code>plan</code> or <code>build</code>.",
-            parse_mode="HTML",
-        )
-        return
-
-    await session_mgr.set_mode(user_id, mode)
-    emoji = "📋" if mode == "plan" else "🔨"
-
+    await session_mgr.set_mode(user_id, "plan")
     await update.message.reply_text(
-        f"{emoji} Mode changed to <b>{mode}</b>",
+        "📋 Mode changed to <b>plan</b>\n\n"
+        "<i>OpenCode is now in read-only analysis mode (no file modifications).</i>",
+        parse_mode="HTML",
+    )
+
+
+async def build_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Switch the current session to build mode (read, write, execute)."""
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    await session_mgr.set_mode(user_id, "build")
+    await update.message.reply_text(
+        "🔨 Mode changed to <b>build</b>\n\n"
+        "<i>OpenCode can now read, write files, and execute commands.</i>",
         parse_mode="HTML",
     )
 
@@ -881,7 +871,8 @@ async def set_bot_commands(app) -> None:
         BotCommand("disable", "Disable live progress streaming"),
         BotCommand("sessions", "List your sessions"),
         BotCommand("models", "List all available models"),
-        BotCommand("mode", "Toggle plan/build mode"),
+        BotCommand("plan", "Switch to plan mode (read-only)"),
+        BotCommand("build", "Switch to build mode (read, write, execute)"),
         BotCommand("share", "Share current session"),
         BotCommand("status", "Bot & connection status"),
         BotCommand("id", "Show your Telegram user ID"),
@@ -1012,6 +1003,57 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"❌ Session <code>{html.escape(resolved_id[:8])}</code> not found.",
                 parse_mode="HTML",
             )
+
+    # 1.5 Handle Sensitive Operations / Tool Permissions
+    elif data.startswith("perm:"):
+        parts = data.split(":")
+        if len(parts) == 3:
+            action = parts[1]      # "allow" or "deny"
+            short_key = parts[2]   # 8-char lookup key
+            
+            pending_perms = bot_data.get("pending_permissions", {})
+            pending = pending_perms.get(short_key)
+            
+            if not pending:
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n⚠️ <b>Request Expired:</b> This permission prompt is no longer valid or the bot was restarted.",
+                    parse_mode="HTML"
+                )
+                return
+                
+            session_id = pending["session_id"]
+            permission_id = pending["permission_id"]
+            
+            response_value = "once" if action == "allow" else "reject"
+            
+            try:
+                # Call our client's respond_to_permission method
+                success = await oc_client.respond_to_permission(
+                    session_id=session_id,
+                    permission_id=permission_id,
+                    response=response_value,
+                    remember=False
+                )
+                
+                # Delete from registry
+                pending_perms.pop(short_key, None)
+                
+                # Format final notification status
+                if response_value == "once":
+                    status_text = "✅ <b>Approved:</b> The agent was allowed to perform this operation."
+                else:
+                    status_text = "❌ <b>Rejected:</b> The agent was denied permission to perform this operation."
+                
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n{status_text}",
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.error(f"Error responding to permission {permission_id} in callback: {e}", exc_info=True)
+                await query.edit_message_text(
+                    text=f"{query.message.text}\n\n⚠️ <b>Error:</b> Failed to submit decision to OpenCode server: {e}",
+                    parse_mode="HTML"
+                )
 
     # 2. Switch Model tap
     elif data.startswith("model:"):

@@ -41,7 +41,8 @@ from handlers.commands import (
     help_command,
     new_command,
     sessions_command,
-    mode_command,
+    plan_command,
+    build_command,
     share_command,
     status_command,
     id_command,
@@ -53,7 +54,7 @@ from handlers.commands import (
     set_bot_commands,
     callback_handler,
 )
-from handlers.messages import handle_message
+from handlers.messages import handle_message, handle_document
 
 # ── Logging Setup ──────────────────────────────────────────
 logging.basicConfig(
@@ -105,8 +106,12 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         await sessions_command(update, context)
 
     @authorized(authorizer, rate_limiter)
-    async def _mode(update, context):
-        await mode_command(update, context)
+    async def _plan(update, context):
+        await plan_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
+    async def _build(update, context):
+        await build_command(update, context)
 
     @authorized(authorizer, rate_limiter)
     async def _share(update, context):
@@ -148,6 +153,10 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
     async def _message(update, context):
         await handle_message(update, context)
 
+    @authorized(authorizer, rate_limiter)
+    async def _document(update, context):
+        await handle_document(update, context)
+
     return {
         "start": _start,
         "help": _help,
@@ -158,12 +167,14 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "project": _project,
         "enable": _enable,
         "disable": _disable,
-        "mode": _mode,
+        "plan": _plan,
+        "build": _build,
         "share": _share,
         "status": _status,
         "id": _id,
         "callback": _callback,
         "message": _message,
+        "document": _document,
     }
 
 
@@ -445,7 +456,8 @@ def main():
     application.add_handler(CommandHandler("project", handlers["project"], block=False))
     application.add_handler(CommandHandler("enable", handlers["enable"], block=False))
     application.add_handler(CommandHandler("disable", handlers["disable"], block=False))
-    application.add_handler(CommandHandler("mode", handlers["mode"], block=False))
+    application.add_handler(CommandHandler("plan", handlers["plan"], block=False))
+    application.add_handler(CommandHandler("build", handlers["build"], block=False))
     application.add_handler(CommandHandler("share", handlers["share"], block=False))
     application.add_handler(CommandHandler("status", handlers["status"], block=False))
     application.add_handler(CommandHandler("id", handlers["id"], block=False))
@@ -458,6 +470,15 @@ def main():
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             handlers["message"],
+            block=False,
+        )
+    )
+
+    # ── Register document handler (catches file uploads) ──
+    application.add_handler(
+        MessageHandler(
+            (filters.Document.ALL | filters.PHOTO) & ~filters.COMMAND,
+            handlers["document"],
             block=False,
         )
     )

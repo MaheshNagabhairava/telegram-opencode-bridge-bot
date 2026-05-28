@@ -13,6 +13,7 @@ A lightweight Python bot that bridges your Telegram messages directly to [OpenCo
 - **Auto message splitting** — handles responses longer than Telegram's 4096 char limit
 - **Security** — whitelist-based access control + rate limiting
 - **Workspace Switching** — Switching from one workspace to another
+- **Uploading from Mobile to WorkSpace** - U can upload the documents/images from your mobile to the opencode agent workspace
 
 ## 📋 Prerequisites
 
@@ -28,7 +29,7 @@ A lightweight Python bot that bridges your Telegram messages directly to [OpenCo
 
 ### Quick Installation:
 ```bash
-pip install telegram-opencode-bridge-bot==0.1.4
+pip install telegram-opencode-bridge-bot==0.1.5
 telegram-opencode-bot
 telegram-opencode-bot --env (use --env flag if u want to re-configure later anytime)
 ```
@@ -60,7 +61,8 @@ Open Telegram, find your bot, and start asking! 🎉
 | `/help` | Show all commands |
 | `/new` | Start a fresh conversation |
 | `/sessions` | List your recent sessions/conversations and to select a session/conversation |
-| `/mode <plan\|build>` | Toggle plan/build mode |
+| `/plan` | plan mode |
+| `/build` | build mode |
 | `/share` | Share current session/conversation (public URL) |
 | `/status` | Check connection & session details |
 | `/id` | Show your Telegram user ID |

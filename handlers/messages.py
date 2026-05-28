@@ -7,8 +7,9 @@ through here to OpenCode's HTTP API (or subprocess fallback).
 
 import logging
 import asyncio
+import os
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram.constants import ChatAction
 
@@ -106,6 +107,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not message_text or not message_text.strip():
         return
 
+    status_msg = None
+
     bot_data = context.bot_data
     session_mgr = bot_data["session_manager"]
     oc_client = bot_data["opencode_client"]
@@ -137,11 +140,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Check if streaming is enabled
     is_streaming = await session_mgr.get_user_streaming(user_id, 0)
     
-    sse_task = None
-    if is_streaming == 1:
-        sse_task = asyncio.create_task(
-            _listen_and_stream_events(update, session_id, config.opencode_server_url)
+    # Send a premium dynamic phase status message to keep user informed in real-time
+    status_msg = await update.message.reply_text(
+        "🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>",
+        parse_mode="HTML"
+    )
+    
+    # Always spawn the SSE event stream listener so we can handle interactive permission prompts
+    # (e.g. for sensitive files like .env) even if the user has disabled regular tool-call progress.
+    sse_task = asyncio.create_task(
+        _listen_and_stream_events(
+            update=update,
+            context=context,
+            session_id=session_id,
+            server_url=config.opencode_server_url,
+            is_streaming=bool(is_streaming == 1),
+            status_msg=status_msg
         )
+    )
 
     typing_task = asyncio.create_task(
         _keep_typing(update, config.response_timeout)
@@ -259,6 +275,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             typing_task.cancel()
         if sse_task:
             sse_task.cancel()
+        # Clean up by deleting the temporary live phase status message
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
 
     # ── 4. Track the message ──────────────────────────────
     await session_mgr.increment_message_count(user_id, prompt=message_text)
@@ -354,15 +376,26 @@ async def _keep_typing(update: Update, max_seconds: int = 3600) -> None:
         pass  # Don't crash on typing indicator failures
 
 
-async def _listen_and_stream_events(update: Update, session_id: str, server_url: str):
-    """Listens to global OpenCode events via SSE and posts tool-call progress live on Telegram."""
+async def _listen_and_stream_events(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    session_id: str,
+    server_url: str,
+    is_streaming: bool,
+    status_msg = None
+):
+    """Listens to global OpenCode events via SSE and handles tool progress/permission requests."""
     import aiohttp
     import json
     import html
+    import uuid
+    import time
+    import os
 
     url = f"{server_url.rstrip('/')}/global/event"
     notified_calls = set()
     completed_calls = set()
+    last_update_time = [0.0]
 
     def truncate(text, max_len=500):
         if not text:
@@ -371,6 +404,16 @@ async def _listen_and_stream_events(update: Update, session_id: str, server_url:
         if len(text) > max_len:
             return text[:max_len] + "\n... (truncated)"
         return text
+
+    async def update_status(text: str):
+        now = time.time()
+        # Throttling to respect Telegram API rate limits (minimum 1.5 seconds between message edits)
+        if status_msg and (now - last_update_time[0] >= 1.5):
+            try:
+                await status_msg.edit_text(text, parse_mode="HTML")
+                last_update_time[0] = now
+            except Exception as e:
+                logger.debug(f"Failed to update status message: {e}")
 
     async with aiohttp.ClientSession() as sse_session:
         try:
@@ -383,7 +426,6 @@ async def _listen_and_stream_events(update: Update, session_id: str, server_url:
                     data_content = line_str[5:].strip()
                     try:
                         event_obj = json.loads(data_content)
-                        # Check if sessionID matches
                         payload = event_obj.get("payload", {})
                         if not isinstance(payload, dict):
                             continue
@@ -397,7 +439,61 @@ async def _listen_and_stream_events(update: Update, session_id: str, server_url:
                             continue
 
                         event_type = payload.get("type", "")
-                        if event_type == "message.part.updated":
+
+                        # A. Handle Permission Requested Popup (Always Enabled)
+                        if event_type == "permission.asked":
+                            perm_id = properties.get("id") or properties.get("permissionID") or payload.get("id")
+                            perm_type = properties.get("permission") or properties.get("type") or "execute"
+                            patterns = properties.get("patterns", [])
+
+                            if not perm_id:
+                                logger.warning("Received permission.asked event but no permission ID was found.")
+                                continue
+
+                            # Register pending permission in-memory lookup to avoid Telegram 64-char callback limit
+                            if "pending_permissions" not in context.bot_data:
+                                context.bot_data["pending_permissions"] = {}
+
+                            short_key = uuid.uuid4().hex[:8]
+                            context.bot_data["pending_permissions"][short_key] = {
+                                "session_id": session_id,
+                                "permission_id": perm_id
+                            }
+
+                            patterns_text = ""
+                            if patterns:
+                                pat_list = "\n".join([f"• <code>{html.escape(str(p))}</code>" for p in patterns])
+                                patterns_text = f"\n<b>Target Resource(s):</b>\n{pat_list}"
+
+                            tool_name = ""
+                            tool_info = properties.get("tool", {})
+                            if isinstance(tool_info, dict):
+                                tool_name = tool_info.get("name", "")
+                            if not tool_name:
+                                tool_name = perm_type
+
+                            msg = (
+                                f"🛡️ <b>OpenCode Permission Requested</b>\n\n"
+                                f"The agent is asking for confirmation to use the tool <code>{html.escape(tool_name)}</code>.\n"
+                                f"{patterns_text}\n\n"
+                                f"Do you want to allow this operation?"
+                            )
+
+                            keyboard = [
+                                [
+                                    InlineKeyboardButton("✅ Yes, Allow", callback_data=f"perm:allow:{short_key}"),
+                                    InlineKeyboardButton("❌ No, Deny", callback_data=f"perm:deny:{short_key}")
+                                ]
+                            ]
+
+                            await update.message.reply_text(
+                                msg,
+                                parse_mode="HTML",
+                                reply_markup=InlineKeyboardMarkup(keyboard)
+                            )
+
+                        # B. Handle Tool Execution Progress
+                        elif event_type == "message.part.updated":
                             part = properties.get("part", {})
                             if not isinstance(part, dict):
                                 continue
@@ -416,62 +512,88 @@ async def _listen_and_stream_events(update: Update, session_id: str, server_url:
                                 metadata = state.get("metadata", {})
                                 if not isinstance(metadata, dict):
                                     metadata = {}
-                                
-                                # 1. Tool Call Started / Running
-                                if status in ("pending", "running") and call_id not in notified_calls:
-                                    notified_calls.add(call_id)
-                                    
-                                    desc = input_data.get("description", "") if isinstance(input_data, dict) else ""
-                                    desc_text = f" — <i>\"{html.escape(desc)}\"</i>" if desc else ""
-                                    
-                                    # Format arguments
-                                    arg_lines = []
-                                    if isinstance(input_data, dict):
-                                        for k, v in input_data.items():
-                                            if k not in ("description", "content"):
-                                                arg_lines.append(f"<b>{html.escape(str(k))}:</b> {html.escape(truncate(str(v)))}")
-                                    args_text = "\n".join(arg_lines)
-                                    
-                                    msg = (
-                                        f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>{desc_text}\n"
-                                    )
-                                    if args_text:
-                                        msg += f"{args_text}\n"
-                                        
-                                    await update.message.reply_text(msg, parse_mode="HTML")
 
-                                # 2. Tool Completed
-                                elif status == "completed" and call_id not in completed_calls:
-                                    completed_calls.add(call_id)
-                                    
-                                    exit_code = metadata.get("exit", 0)
-                                    output_cleaned = truncate(str(output_data))
-                                    
-                                    msg = (
-                                        f"✅ <b>Tool <code>{html.escape(tool_name)}</code> Completed</b> (Exit <code>{exit_code}</code>)\n"
-                                    )
-                                    if output_cleaned.strip():
-                                        msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+                                # ── 1. Update In-Place Status Message (Always Active) ──
+                                if status in ("pending", "running") and status_msg:
+                                    status_text = ""
+                                    if tool_name == "bash":
+                                        cmd = input_data.get("command") or input_data.get("content") or ""
+                                        cmd_truncated = truncate(cmd, 60)
+                                        status_text = f"💻 <b>Running shell command...</b>\n<code>{html.escape(cmd_truncated)}</code>"
+                                    elif tool_name in ("edit", "write", "save"):
+                                        path = input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
+                                        path_truncated = truncate(os.path.basename(path) if path else "", 60)
+                                        status_text = f"📝 <b>Modifying file...</b>\n<code>{html.escape(path_truncated)}</code>"
+                                    elif tool_name in ("read", "view", "show"):
+                                        path = input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
+                                        path_truncated = truncate(os.path.basename(path) if path else "", 60)
+                                        status_text = f"🔍 <b>Reading file...</b>\n<code>{html.escape(path_truncated)}</code>"
+                                    elif tool_name in ("webfetch", "websearch", "search"):
+                                        query = input_data.get("query") or input_data.get("url") or ""
+                                        query_truncated = truncate(query, 60)
+                                        status_text = f"🌐 <b>Searching web...</b>\n<code>{html.escape(query_truncated)}</code>"
                                     else:
-                                        msg += f"<i>(No output returned)</i>"
-                                        
-                                    await update.message.reply_text(msg, parse_mode="HTML")
+                                        status_text = f"⚙️ <b>Executing tool <code>{html.escape(tool_name)}</code>...</b>"
+                                    
+                                    await update_status(status_text)
 
-                                # 3. Tool Failed
-                                elif status in ("failed", "error") and call_id not in completed_calls:
-                                    completed_calls.add(call_id)
-                                    
-                                    output_cleaned = truncate(str(output_data))
-                                    
-                                    msg = (
-                                        f"❌ <b>Tool <code>{html.escape(tool_name)}</code> Failed</b>\n"
-                                    )
-                                    if output_cleaned.strip():
-                                        msg += f"<pre>{html.escape(output_cleaned)}</pre>"
-                                    else:
-                                        msg += f"<i>(No error description returned)</i>"
+                                # ── 2. Stream Full Tool Logs (Only if is_streaming is True) ──
+                                if is_streaming:
+                                    # 1. Tool Call Started / Running
+                                    if status in ("pending", "running") and call_id not in notified_calls:
+                                        notified_calls.add(call_id)
                                         
-                                    await update.message.reply_text(msg, parse_mode="HTML")
+                                        desc = input_data.get("description", "") if isinstance(input_data, dict) else ""
+                                        desc_text = f" — <i>\"{html.escape(desc)}\"</i>" if desc else ""
+                                        
+                                        # Format arguments
+                                        arg_lines = []
+                                        if isinstance(input_data, dict):
+                                            for k, v in input_data.items():
+                                                if k not in ("description", "content"):
+                                                    arg_lines.append(f"<b>{html.escape(str(k))}:</b> {html.escape(truncate(str(v)))}")
+                                        args_text = "\n".join(arg_lines)
+                                        
+                                        msg = (
+                                            f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>{desc_text}\n"
+                                        )
+                                        if args_text:
+                                            msg += f"{args_text}\n"
+                                            
+                                        await update.message.reply_text(msg, parse_mode="HTML")
+
+                                    # 2. Tool Completed
+                                    elif status == "completed" and call_id not in completed_calls:
+                                        completed_calls.add(call_id)
+                                        
+                                        exit_code = metadata.get("exit", 0)
+                                        output_cleaned = truncate(str(output_data))
+                                        
+                                        msg = (
+                                            f"✅ <b>Tool <code>{html.escape(tool_name)}</code> Completed</b> (Exit <code>{exit_code}</code>)\n"
+                                        )
+                                        if output_cleaned.strip():
+                                            msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+                                        else:
+                                            msg += f"<i>(No output returned)</i>"
+                                            
+                                        await update.message.reply_text(msg, parse_mode="HTML")
+
+                                    # 3. Tool Failed
+                                    elif status in ("failed", "error") and call_id not in completed_calls:
+                                        completed_calls.add(call_id)
+                                        
+                                        output_cleaned = truncate(str(output_data))
+                                        
+                                        msg = (
+                                            f"❌ <b>Tool <code>{html.escape(tool_name)}</code> Failed</b>\n"
+                                        )
+                                        if output_cleaned.strip():
+                                            msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+                                        else:
+                                            msg += f"<i>(No error description returned)</i>"
+                                            
+                                        await update.message.reply_text(msg, parse_mode="HTML")
 
                     except Exception as e:
                         logger.debug(f"Error parsing SSE event in listener: {e}")
@@ -480,3 +602,217 @@ async def _listen_and_stream_events(update: Update, session_id: str, server_url:
             pass
         except Exception as e:
             logger.warning(f"Error in SSE streaming task listener: {e}")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle incoming file uploads (documents and gallery photos) from Telegram,
+    download them to the active workspace, and trigger the OpenCode agent for analysis.
+    """
+    user = update.effective_user
+    user_id = user.id
+    
+    document = update.message.document
+    photo_list = update.message.photo
+
+    if not document and not photo_list:
+        return
+
+    bot_data = context.bot_data
+    session_mgr = bot_data["session_manager"]
+    oc_client = bot_data["opencode_client"]
+    config = bot_data["config"]
+
+    import uuid
+    import time
+
+    # 1. Extract file metadata
+    if document:
+        filename = document.file_name or "uploaded_file"
+        file_id = document.file_id
+        file_size = document.file_size
+    else:
+        # It's a photo from gallery
+        photo = photo_list[-1]  # Get largest resolution photo
+        filename = f"photo_{int(time.time())}_{uuid.uuid4().hex[:6]}.jpg"
+        file_id = photo.file_id
+        file_size = photo.file_size
+
+    # 2. Path Traversal & Security Sanitization
+    sanitized_filename = os.path.basename(filename)
+
+    # 3. Get active workspace directory
+    work_dir = await session_mgr.get_user_work_dir(user_id, config.opencode_work_dir)
+    os.makedirs(work_dir, exist_ok=True)
+    destination_path = os.path.join(work_dir, sanitized_filename)
+
+    # 4. Check 20MB Telegram Bot API download limit
+    max_size = 20 * 1024 * 1024  # 20MB in bytes
+    if file_size > max_size:
+        await update.message.reply_text(
+            f"⚠️ <b>File Too Large!</b>\n\n"
+            f"Telegram standard bots are restricted to downloads under 20MB. "
+            f"Your file size is <code>{file_size / (1024*1024):.2f}MB</code>.\n\n"
+            f"Please copy the file manually to your local project folder:\n"
+            f"<code>{html.escape(work_dir)}</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    # 5. Overwrite Protection (Backup existing files)
+    if os.path.exists(destination_path):
+        backup_path = destination_path + ".bak"
+        try:
+            if os.path.exists(backup_path):
+                os.remove(backup_path)  # Delete old backup if present
+            os.rename(destination_path, backup_path)
+            logger.info(f"Backed up existing file {sanitized_filename} to {sanitized_filename}.bak")
+        except Exception as e:
+            logger.warning(f"Failed to backup existing file {sanitized_filename}: {e}")
+
+    import html
+
+    # 6. Send progress / typing indicator
+    status_notice = await update.message.reply_text(
+        f"📥 <b>Downloading file...</b>\n"
+        f"Saving <code>{html.escape(sanitized_filename)}</code> directly to your local project workspace.",
+        parse_mode="HTML"
+    )
+
+    try:
+        # Download file via Telegram API
+        file_obj = await context.bot.get_file(file_id)
+        await file_obj.download_to_drive(custom_path=destination_path)
+        
+        await status_notice.delete()
+    except Exception as e:
+        logger.error(f"Failed to download file from Telegram: {e}", exc_info=True)
+        try:
+            await status_notice.edit_text(
+                f"❌ <b>Download Failed</b>\n\n"
+                f"Failed to fetch file from Telegram: <code>{html.escape(str(e))}</code>",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
+        return
+
+    # 7. Retrieve Caption / Prompt
+    caption = sanitize_input(update.message.caption or "")
+
+    if caption and caption.strip():
+        # User uploaded a file AND wrote a caption/instruction (e.g. "Explain this code")
+        # Format a unified prompt for the OpenCode agent
+        prompt_text = (
+            f"[System Notification: The user uploaded the file '{sanitized_filename}' "
+            f"successfully into the active workspace directory. Please analyze it based on their prompt below.]\n\n"
+            f"{caption}"
+        )
+        
+        # Route to standard message pipeline!
+        # First, ensure OpenCode server is running
+        if not await ensure_server_running(update, context, user_id):
+            return
+
+        await update.message.chat.send_action(ChatAction.TYPING)
+
+        # Get or create active session
+        session_id = await session_mgr.get_active_session(user_id)
+        if not session_id:
+            try:
+                session_id = await _create_session(oc_client, user_id, session_mgr, config)
+            except Exception as se:
+                logger.error(f"Failed to create session during document upload: {se}", exc_info=True)
+                await update.message.reply_text(
+                    format_error(f"Failed to create session: {se}"),
+                    parse_mode="HTML"
+                )
+                return
+
+        # Start dynamic phase status indicator and streaming
+        is_streaming = await session_mgr.get_user_streaming(user_id, 0)
+        status_msg = await update.message.reply_text(
+            "🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>",
+            parse_mode="HTML"
+        )
+
+        sse_task = asyncio.create_task(
+            _listen_and_stream_events(
+                update=update,
+                context=context,
+                session_id=session_id,
+                server_url=config.opencode_server_url,
+                is_streaming=bool(is_streaming == 1),
+                status_msg=status_msg
+            )
+        )
+
+        typing_task = asyncio.create_task(
+            _keep_typing(update, config.response_timeout)
+        )
+
+        try:
+            session_info = await session_mgr.get_session_info(user_id)
+            session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+
+            response_text = await _send_to_opencode(
+                oc_client=oc_client,
+                session_id=session_id,
+                prompt=prompt_text,
+                model=session_model,
+            )
+
+            # Increment count
+            await session_mgr.increment_message_count(user_id, prompt=caption)
+
+            # Send response back to user
+            if response_text and response_text != "ABORTED":
+                formatted = format_opencode_response(response_text)
+                chunks = split_message(formatted, config.max_message_length)
+                for i, chunk in enumerate(chunks):
+                    try:
+                        await update.message.reply_text(
+                            chunk,
+                            parse_mode="HTML",
+                            disable_web_page_preview=True,
+                        )
+                    except Exception as he:
+                        import re
+                        plain = re.sub(r'<[^>]+>', '', chunk)
+                        await update.message.reply_text(
+                            plain,
+                            disable_web_page_preview=True,
+                        )
+                    if i < len(chunks) - 1:
+                        await asyncio.sleep(0.5)
+
+        except Exception as e:
+            logger.error(f"Error analyzing uploaded file: {e}", exc_info=True)
+            await update.message.reply_text(
+                format_error(str(e)),
+                parse_mode="HTML"
+            )
+        finally:
+            if typing_task:
+                typing_task.cancel()
+            if sse_task:
+                sse_task.cancel()
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+
+    else:
+        # File uploaded with NO caption/prompt.
+        # Just send a high-fidelity confirmation card!
+        size_display = f"{file_size / 1024:.2f} KB" if file_size < 1024*1024 else f"{file_size / (1024*1024):.2f} MB"
+        
+        confirmation = (
+            f"📥 <b>File Saved Successfully!</b>\n\n"
+            f"• <b>Filename:</b> <code>{html.escape(sanitized_filename)}</code>\n"
+            f"• <b>Size:</b> <code>{size_display}</code>\n"
+            f"• <b>Destination:</b> <code>{html.escape(work_dir)}</code>\n\n"
+            f"<i>OpenCode can now read and access this file locally. Ask me anything about it!</i>"
+        )
+        
+        await update.message.reply_text(confirmation, parse_mode="HTML")

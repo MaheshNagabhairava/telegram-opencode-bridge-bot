@@ -441,3 +441,51 @@ class OpenCodeClient:
         except Exception as e:
             logger.error(f"Unexpected error aborting session {session_id}: {e}")
             raise
+
+    async def respond_to_permission(
+        self,
+        session_id: str,
+        permission_id: str,
+        response: str,
+        remember: bool = False,
+    ) -> bool:
+        """Respond to a pending tool/file permission request in a session.
+
+        Parameters:
+            session_id: The session identifier.
+            permission_id: The permission request identifier.
+            response: "once" | "always" | "reject" (or legacy "allow" | "deny").
+            remember: Whether to remember this decision for future operations in this session.
+
+        Returns:
+            True if the server successfully recorded the response, False otherwise.
+        """
+        # Map legacy/semantic allow/deny values to OpenCode's strict once/always/reject contract
+        normalized = response.lower().strip()
+        if normalized == "allow":
+            normalized = "once"
+        elif normalized == "deny":
+            normalized = "reject"
+
+        payload = {
+            "response": normalized,
+            "remember": remember,
+        }
+        logger.info(
+            f"Sending permission response: session={session_id[:8]}... perm={permission_id} action={normalized}"
+        )
+        try:
+            result = await self._request(
+                "POST",
+                f"/session/{session_id}/permissions/{permission_id}",
+                json_data=payload,
+            )
+            if isinstance(result, dict):
+                return result.get("success", True)
+            return True
+        except Exception as e:
+            logger.error(
+                f"Failed to respond to permission {permission_id} in session {session_id}: {e}"
+            )
+            raise
+
