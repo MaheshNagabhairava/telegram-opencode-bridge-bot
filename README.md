@@ -6,7 +6,7 @@ A lightweight Python bot that bridges your Telegram messages directly to [OpenCo
 
 - **Direct OpenCode integration** — routes your messages to OpenCode's HTTP API
 - **Persistent sessions** — conversations maintain context across messages
-- **Session management** — create, switch, list, and share sessions
+- **Session management** — create, delete, switch, list, and share sessions
 - **Model switching** — change AI models on the fly (`/model`)
 - **Plan/Build modes** — toggle between read-only analysis and full execution
 - **Smart formatting** — code blocks with syntax highlighting in Telegram
@@ -14,6 +14,7 @@ A lightweight Python bot that bridges your Telegram messages directly to [OpenCo
 - **Security** — whitelist-based access control + rate limiting
 - **Workspace Switching** — Switching from one workspace to another
 - **Uploading from Mobile to WorkSpace** - U can upload the documents/images from your mobile to the opencode agent workspace
+- **Workspace Management** — Creation and deletion of the workspace/folder
 
 ## 📋 Prerequisites
 
@@ -29,7 +30,7 @@ A lightweight Python bot that bridges your Telegram messages directly to [OpenCo
 
 ### Quick Installation:
 ```bash
-pip install telegram-opencode-bridge-bot==0.1.5
+pip install telegram-opencode-bridge-bot==0.1.6
 telegram-opencode-bot
 telegram-opencode-bot --env (use --env flag if u want to re-configure later anytime)
 ```
@@ -71,6 +72,9 @@ Open Telegram, find your bot, and start asking! 🎉
 | `/project` | To view the current workspace, sub folder workspaces and to change the workspace |
 | `/enable` | To enable the streaming |
 | `/disable` | To disable the streaming |
+| `/create_project` | To create new project/folder/workspace |
+| `/delete_project` | To create new project/folder/workspace |
+| `/delete` | To delete a conversation |
 
 ## 🏗️ Architecture
 

@@ -415,7 +415,7 @@ async def _listen_and_stream_events(
             except Exception as e:
                 logger.debug(f"Failed to update status message: {e}")
 
-    async with aiohttp.ClientSession() as sse_session:
+    async with aiohttp.ClientSession(read_bufsize=100 * 1024 * 1024) as sse_session:
         try:
             async with sse_session.get(url, headers={"Accept": "text/event-stream"}) as resp:
                 async for line in resp.content:

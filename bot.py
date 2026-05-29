@@ -41,6 +41,7 @@ from handlers.commands import (
     help_command,
     new_command,
     sessions_command,
+    delete_command,
     plan_command,
     build_command,
     share_command,
@@ -49,6 +50,8 @@ from handlers.commands import (
     models_command,
     stop_command,
     project_command,
+    create_project_command,
+    delete_project_command,
     enable_command,
     disable_command,
     set_bot_commands,
@@ -106,6 +109,10 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         await sessions_command(update, context)
 
     @authorized(authorizer, rate_limiter)
+    async def _delete(update, context):
+        await delete_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
     async def _plan(update, context):
         await plan_command(update, context)
 
@@ -138,6 +145,14 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         await project_command(update, context)
 
     @authorized(authorizer, rate_limiter)
+    async def _create_project(update, context):
+        await create_project_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
+    async def _delete_project(update, context):
+        await delete_project_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
     async def _enable(update, context):
         await enable_command(update, context)
 
@@ -162,9 +177,12 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "help": _help,
         "new": _new,
         "sessions": _sessions,
+        "delete": _delete,
         "models": _models,
         "stop": _stop,
         "project": _project,
+        "create_project": _create_project,
+        "delete_project": _delete_project,
         "enable": _enable,
         "disable": _disable,
         "plan": _plan,
@@ -451,9 +469,12 @@ def main():
     application.add_handler(CommandHandler("help", handlers["help"], block=False))
     application.add_handler(CommandHandler("new", handlers["new"], block=False))
     application.add_handler(CommandHandler("sessions", handlers["sessions"], block=False))
+    application.add_handler(CommandHandler("delete", handlers["delete"], block=False))
     application.add_handler(CommandHandler("models", handlers["models"], block=False))
     application.add_handler(CommandHandler("stop", handlers["stop"], block=False))
     application.add_handler(CommandHandler("project", handlers["project"], block=False))
+    application.add_handler(CommandHandler("create_project", handlers["create_project"], block=False))
+    application.add_handler(CommandHandler("delete_project", handlers["delete_project"], block=False))
     application.add_handler(CommandHandler("enable", handlers["enable"], block=False))
     application.add_handler(CommandHandler("disable", handlers["disable"], block=False))
     application.add_handler(CommandHandler("plan", handlers["plan"], block=False))

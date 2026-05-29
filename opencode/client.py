@@ -133,6 +133,7 @@ class OpenCodeClient:
             self._session = aiohttp.ClientSession(
                 timeout=self.timeout,
                 auth=self._auth,
+                read_bufsize=100 * 1024 * 1024,
             )
         return self._session
 
@@ -487,5 +488,16 @@ class OpenCodeClient:
             logger.error(
                 f"Failed to respond to permission {permission_id} in session {session_id}: {e}"
             )
+            raise
+
+    async def delete_session(self, session_id: str) -> bool:
+        """Permanently delete a session and all its context on the OpenCode server."""
+        try:
+            result = await self._request("DELETE", f"/session/{session_id}")
+            if isinstance(result, dict):
+                return result.get("success", True)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete session {session_id} on server: {e}")
             raise
 

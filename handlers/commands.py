@@ -56,9 +56,12 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/new — Start a fresh conversation (clears current session)\n"
         "/stop — Stop/abort the current active task\n"
         "/project — View & switch active project directories\n"
+        "/create_project — Create a new workspace folder\n"
+        "/delete_project — Delete a workspace folder\n"
         "/enable — Enable live tool call & progress streaming\n"
         "/disable — Disable live progress streaming\n"
         "/sessions — List your recent sessions (tap to switch)\n"
+        "/delete — Permanently delete a session\n"
         "/models — List all available models (tap to change)\n"
         "/plan — Switch to plan mode (read-only)\n"
         "/build — Switch to build mode (read, write, execute)\n"
@@ -249,6 +252,88 @@ async def sessions_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         lines.append("\n<i>Send a message to start a conversation!</i>")
 
     await update.message.reply_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
+
+
+# ──────────────────────────────────────────────
+# Command: /delete
+# ──────────────────────────────────────────────
+async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List recent sessions for this user in their active workspace for deletion."""
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    oc_client = context.bot_data["opencode_client"]
+    config = context.bot_data["config"]
+
+    # Ensure OpenCode server is running dynamically
+    from handlers.messages import ensure_server_running
+    if not await ensure_server_running(update, context, user_id):
+        return
+
+    # Resolve workspace
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+    current_dir = os.path.abspath(current_dir)
+
+    def norm(p):
+        if not p:
+            return ""
+        return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+    current_dir_norm = norm(current_dir)
+
+    # Fetch server sessions
+    server_sessions = []
+    try:
+        server_sessions = await oc_client.list_sessions()
+    except Exception as e:
+        logger.warning(f"Could not fetch sessions from server during delete call: {e}")
+        await update.message.reply_text(
+            "⚠️ Could not reach the OpenCode server to list sessions.\n"
+            "Make sure <code>opencode serve</code> is running.",
+            parse_mode="HTML",
+        )
+        return
+
+    # Filter to current workspace
+    workspace_sessions = []
+    for s in server_sessions:
+        s_dir = s.get("directory", "")
+        if norm(s_dir) == current_dir_norm:
+            workspace_sessions.append(s)
+
+    if not workspace_sessions:
+        folder_name = os.path.basename(current_dir) or "Root"
+        await update.message.reply_text(
+            f"📭 No sessions found in project <b>{html.escape(folder_name)}</b> to delete.",
+            parse_mode="HTML",
+        )
+        return
+
+    workspace_sessions.sort(
+        key=lambda s: s.get("time", {}).get("updated", 0),
+        reverse=True,
+    )
+
+    active_sid = await session_mgr.get_active_session(user_id)
+
+    folder_name = os.path.basename(current_dir) or "Root"
+    text = (
+        f"🗑️ <b>Delete Session (Workspace: {html.escape(folder_name)})</b>\n\n"
+        f"Choose a session below to permanently delete it from your local machine and the server.\n\n"
+        f"⚠️ <b>WARNING:</b> This cannot be undone!"
+    )
+
+    keyboard = []
+    for s in workspace_sessions:
+        s_id = s.get("id", "")
+        s_title = s.get("title", "") or s_id[:8]
+        is_active = (s_id == active_sid)
+        marker = "🔹 (Current)" if is_active else "📄"
+        button_text = f"❌ Delete {s_title} {marker}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"delsess:{s_id}")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
 
 
 # ──────────────────────────────────────────────
@@ -867,9 +952,12 @@ async def set_bot_commands(app) -> None:
         BotCommand("new", "Start a fresh conversation"),
         BotCommand("stop", "Stop/abort the current active task"),
         BotCommand("project", "View & switch project folders"),
+        BotCommand("create_project", "Create a new workspace folder"),
+        BotCommand("delete_project", "Delete an existing workspace folder"),
         BotCommand("enable", "Enable live progress streaming"),
         BotCommand("disable", "Disable live progress streaming"),
         BotCommand("sessions", "List your sessions"),
+        BotCommand("delete", "Permanently delete a session"),
         BotCommand("models", "List all available models"),
         BotCommand("plan", "Switch to plan mode (read-only)"),
         BotCommand("build", "Switch to build mode (read, write, execute)"),
@@ -1003,6 +1091,58 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                 f"❌ Session <code>{html.escape(resolved_id[:8])}</code> not found.",
                 parse_mode="HTML",
             )
+
+    # 1.3 Delete Session tap
+    elif data.startswith("delsess:"):
+        target_id = data[len("delsess:"):]
+        
+        from handlers.messages import ensure_server_running
+        if not await ensure_server_running(update, context, user_id):
+            return
+
+        resolved_id = None
+        server_sessions = []
+        try:
+            server_sessions = await oc_client.list_sessions()
+            for s in server_sessions:
+                s_id = s.get("id", "")
+                if s_id.lower().startswith(target_id.lower()):
+                    resolved_id = s_id
+                    break
+        except Exception as e:
+            logger.warning(f"Could not verify session list on server during delete callback: {e}")
+
+        if not resolved_id:
+            resolved_id = target_id
+
+        try:
+            # 1. Delete on OpenCode Server
+            await oc_client.delete_session(resolved_id)
+        except Exception as e:
+            logger.warning(f"Failed to delete session {resolved_id} on server, proceeding locally: {e}")
+
+        # 2. Delete locally in SQLite DB
+        try:
+            await session_mgr._db.execute(
+                "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
+                (user_id, resolved_id)
+            )
+            await session_mgr._db.commit()
+        except Exception as e:
+            logger.error(f"Failed to delete session {resolved_id} in local database: {e}")
+
+        # 3. If active session was deleted, clear active cache and reset
+        active_sid = await session_mgr.get_active_session(user_id)
+        if active_sid == resolved_id:
+            if user_id in session_mgr._active_sessions:
+                del session_mgr._active_sessions[user_id]
+            # Try to auto-resolve first remaining session or let the bot create a new one lazily
+            await session_mgr.clear_session(user_id)
+
+        await query.edit_message_text(
+            f"🗑️ <b>Deleted:</b> Session <code>{html.escape(resolved_id[:8])}</code> has been permanently removed.",
+            parse_mode="HTML",
+        )
 
     # 1.5 Handle Sensitive Operations / Tool Permissions
     elif data.startswith("perm:"):
@@ -1199,4 +1339,304 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             except Exception as e:
                 logger.error(f"Error navigating subfolder: {e}", exc_info=True)
                 await query.edit_message_text(f"❌ Navigation error: {e}")
+
+    # 4. Workspace Deletion callback query flows
+    elif data.startswith("delproj_ask:"):
+        target_folder = data[len("delproj_ask:"):]
+        
+        # Verify it's not active
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        target_path = os.path.abspath(os.path.join(base_dir, target_folder))
+        
+        if os.path.normcase(target_path) == os.path.normcase(current_dir):
+            await query.edit_message_text(
+                f"❌ <b>Cannot Delete Active Workspace:</b>\n"
+                f"You cannot delete your currently active workspace directory <code>{html.escape(target_folder)}</code>.\n"
+                f"Please switch to another workspace folder first using /project, then attempt deletion.",
+                parse_mode="HTML"
+            )
+            return
+
+        warning_text = (
+            f"⚠️ <b>WARNING: Permanent Deletion!</b>\n\n"
+            f"Are you absolutely sure you want to permanently delete the folder <code>{html.escape(target_folder)}</code>?\n\n"
+            f"This will physically **erase all source files and directories** inside this workspace on your computer!\n\n"
+            f"🚨 <b>THIS ACTION CANNOT BE UNDONE!</b>"
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("💥 Yes, Erase Folder", callback_data=f"delproj_confirm:{target_folder}"),
+                InlineKeyboardButton("↩️ Cancel", callback_data="delproj_cancel")
+            ]
+        ]
+        
+        await query.edit_message_text(warning_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+    elif data.startswith("delproj_confirm:"):
+        target_folder = data[len("delproj_confirm:"):]
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        target_path = os.path.abspath(os.path.join(base_dir, target_folder))
+        
+        # 1. Security Check: Path traversal exploit guard
+        if not os.path.normcase(target_path).startswith(os.path.normcase(base_dir)) or target_path == base_dir:
+            await query.edit_message_text(
+                "❌ <b>Security Violation:</b> Deletion path lies outside your parent workspace directory.",
+                parse_mode="HTML"
+            )
+            return
+            
+        # 2. Check if currently active (double check)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        if os.path.normcase(target_path) == os.path.normcase(current_dir):
+            await query.edit_message_text(
+                "❌ <b>Cannot Delete Active Workspace:</b> Please switch to another workspace first.",
+                parse_mode="HTML"
+            )
+            return
+
+        # 3. Perform physical deletion & SQLite sync
+        import shutil
+        try:
+            if os.path.exists(target_path):
+                # Clean up local SQLite DB session history inside the workspace
+                # Let's delete all sessions associated with this path
+                # Since workspace paths are normalized, let's normalize this target path
+                norm_target_path = os.path.normcase(target_path)
+                
+                # Fetch all sessions in the DB to match work_dir
+                cursor = await session_mgr._db.execute("SELECT opencode_session_id, work_dir FROM sessions WHERE user_id = ?", (user_id,))
+                rows = await cursor.fetchall()
+                stale_sids = []
+                
+                def norm(p):
+                    if not p:
+                        return ""
+                    return os.path.normcase(os.path.normpath(os.path.abspath(p)))
+
+                for row in rows:
+                    sid, wd = row
+                    if norm(wd) == norm_target_path:
+                        stale_sids.append(sid)
+
+                if stale_sids:
+                    for sid in stale_sids:
+                        await session_mgr._db.execute(
+                            "DELETE FROM sessions WHERE user_id = ? AND opencode_session_id = ?",
+                            (user_id, sid)
+                        )
+                    await session_mgr._db.commit()
+
+                    # Clear session mgr active cache if active
+                    active_sid = await session_mgr.get_active_session(user_id)
+                    if active_sid in stale_sids:
+                        if user_id in session_mgr._active_sessions:
+                            del session_mgr._active_sessions[user_id]
+                
+                # Physical rmtree
+                shutil.rmtree(target_path)
+                
+                await query.edit_message_text(
+                    f"🗑️ <b>Folder Deleted Successfully!</b>\n\n"
+                    f"The workspace folder <code>{html.escape(target_folder)}</code> and all its files have been permanently erased from your hard drive, "
+                    f"and all session logs are cleared.",
+                    parse_mode="HTML"
+                )
+            else:
+                await query.edit_message_text(
+                    f"❌ <b>Folder not found:</b> The folder <code>{html.escape(target_folder)}</code> no longer exists on disk.",
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            logger.error(f"Failed to delete folder {target_path}: {e}", exc_info=True)
+            await query.edit_message_text(
+                f"❌ <b>Deletion Failed:</b> An error occurred while erasing the directory:\n"
+                f"<code>{html.escape(str(e))}</code>",
+                parse_mode="HTML"
+            )
+
+    elif data == "delproj_cancel":
+        await query.edit_message_text(
+            "↩️ <b>Deletion Cancelled.</b>\n\n"
+            "Your workspace folder and code remain completely untouched.",
+            parse_mode="HTML"
+        )
+
+
+# ──────────────────────────────────────────────
+# Commands: /create_project and /delete_project
+# ──────────────────────────────────────────────
+
+async def create_project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Create a new workspace folder inside the base directory."""
+    import os
+    import html
+    
+    user_id = update.effective_user.id
+    config = context.bot_data["config"]
+    
+    if not context.args:
+        await update.message.reply_text(
+            "⚠️ <b>Usage:</b> /create_project <code>&lt;new_folder_name&gt;</code>\n\n"
+            "Example: <code>/create_project backend-api</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    name = " ".join(context.args).strip()
+    
+    # Strict filename sanitization (keep alphanumeric, space, dash, underscore)
+    cleaned_name = "".join(c for c in name if c.isalnum() or c in ("-", "_", " ")).strip()
+    
+    if not cleaned_name:
+        await update.message.reply_text(
+            "⚠️ <b>Invalid folder name.</b> Only alphanumeric characters, dashes, underscores, and spaces are allowed.",
+            parse_mode="HTML"
+        )
+        return
+
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    target_path = os.path.abspath(os.path.join(base_dir, cleaned_name))
+    
+    # Security traversal check
+    if not os.path.normcase(target_path).startswith(os.path.normcase(base_dir)):
+        await update.message.reply_text(
+            "❌ <b>Security Violation:</b> Target path lies outside your parent workspace directory.",
+            parse_mode="HTML"
+        )
+        return
+
+    # Check existence
+    if os.path.exists(target_path):
+        if os.path.isdir(target_path):
+            await update.message.reply_text(
+                f"ℹ️ <b>Folder already exists.</b> Switching you to <code>{html.escape(cleaned_name)}</code>...",
+                parse_mode="HTML"
+            )
+            await execute_project_switch(update, context, user_id, target_path)
+        else:
+            await update.message.reply_text(
+                f"❌ <b>File conflict:</b> A file named <code>{html.escape(cleaned_name)}</code> already exists at that path.",
+                parse_mode="HTML"
+            )
+        return
+
+    # Physical directory creation
+    try:
+        os.makedirs(target_path, exist_ok=True)
+        await execute_project_switch(update, context, user_id, target_path)
+    except Exception as e:
+        logger.error(f"Failed to create workspace folder {target_path}: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ <b>Folder Creation Failed:</b>\n<code>{html.escape(str(e))}</code>",
+            parse_mode="HTML"
+        )
+
+
+async def delete_project_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List workspaces in base directory for secure deletion."""
+    import os
+    import html
+    
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    config = context.bot_data["config"]
+    
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    
+    # If the user passed a direct folder name in context.args
+    if context.args:
+        arg_folder = " ".join(context.args).strip()
+        cleaned_arg = "".join(c for c in arg_folder if c.isalnum() or c in ("-", "_", " ")).strip()
+        
+        target_path = os.path.abspath(os.path.join(base_dir, cleaned_arg))
+        if not os.path.normcase(target_path).startswith(os.path.normcase(base_dir)) or target_path == base_dir:
+            await update.message.reply_text(
+                "❌ <b>Security Violation:</b> Target path lies outside your parent workspace directory.",
+                parse_mode="HTML"
+            )
+            return
+            
+        if not os.path.exists(target_path) or not os.path.isdir(target_path):
+            await update.message.reply_text(
+                f"❌ <b>Workspace not found:</b> The folder <code>{html.escape(cleaned_arg)}</code> does not exist.",
+                parse_mode="HTML"
+            )
+            return
+            
+        # Verify it's not active
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        if os.path.normcase(target_path) == os.path.normcase(current_dir):
+            await update.message.reply_text(
+                f"❌ <b>Cannot Delete Active Workspace:</b>\n"
+                f"You cannot delete your active workspace. Please switch to another workspace first using /project.",
+                parse_mode="HTML"
+            )
+            return
+
+        warning_text = (
+            f"⚠️ <b>WARNING: Permanent Deletion!</b>\n\n"
+            f"Are you absolutely sure you want to permanently delete the folder <code>{html.escape(cleaned_arg)}</code>?\n\n"
+            f"This will physically **erase all source files and directories** inside this workspace on your computer!\n\n"
+            f"🚨 <b>THIS ACTION CANNOT BE UNDONE!</b>"
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("💥 Yes, Erase Folder", callback_data=f"delproj_confirm:{cleaned_arg}"),
+                InlineKeyboardButton("↩️ Cancel", callback_data="delproj_cancel")
+            ]
+        ]
+        
+        await update.message.reply_text(warning_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        return
+
+    # Otherwise list all subfolders for interactive selection
+    subdirs = get_subdirectories(base_dir)
+    
+    if not subdirs:
+        await update.message.reply_text(
+            "📭 <b>No workspace subdirectories found to delete.</b>",
+            parse_mode="HTML"
+        )
+        return
+
+    current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+    current_dir = os.path.abspath(current_dir)
+    
+    text = (
+        "🗑️ <b>Delete Workspace Folder</b>\n\n"
+        "Select a folder below to permanently delete it from your local machine. "
+        "Stale session histories will be synced automatically.\n\n"
+        "⚠️ <b>WARNING:</b> This erases physical code files!"
+    )
+    
+    keyboard = []
+    for name in subdirs:
+        target_path = os.path.abspath(os.path.join(base_dir, name))
+        is_active = (os.path.normcase(target_path) == os.path.normcase(current_dir))
+        
+        # Don't show delete button for the currently active workspace
+        if is_active:
+            continue
+            
+        button_text = f"❌ Delete {name}"
+        keyboard.append([InlineKeyboardButton(button_text, callback_data=f"delproj_ask:{name}")])
+        
+    if not keyboard:
+        await update.message.reply_text(
+            "📭 <b>No other workspace folders found to delete.</b>\n"
+            "<i>(You cannot delete your currently active workspace)</i>",
+            parse_mode="HTML"
+        )
+        return
+        
+    keyboard.append([InlineKeyboardButton("↩️ Cancel", callback_data="delproj_cancel")])
+    
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
