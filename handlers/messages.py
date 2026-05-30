@@ -146,6 +146,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         parse_mode="HTML"
     )
     
+    status_msg_holder = [status_msg]
+    
     # Always spawn the SSE event stream listener so we can handle interactive permission prompts
     # (e.g. for sensitive files like .env) even if the user has disabled regular tool-call progress.
     sse_task = asyncio.create_task(
@@ -155,14 +157,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             session_id=session_id,
             server_url=config.opencode_server_url,
             is_streaming=bool(is_streaming == 1),
-            status_msg=status_msg
+            status_msg_holder=status_msg_holder
         )
     )
 
     typing_task = asyncio.create_task(
         _keep_typing(update, config.response_timeout)
     )
+    before_ids = set()
+    sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
+    sent_message_ids.clear()
     try:
+        # Fetch message IDs before sending the prompt
+        try:
+            before_messages = await oc_client.list_messages(session_id)
+            before_ids = {m.get("info", {}).get("id") for m in before_messages if m.get("info", {}).get("id")}
+        except Exception as e:
+            logger.warning(f"Failed to fetch messages before prompt: {e}")
+
         session_info = await session_mgr.get_session_info(user_id)
         session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
 
@@ -276,9 +288,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if sse_task:
             sse_task.cancel()
         # Clean up by deleting the temporary live phase status message
-        if status_msg:
+        if status_msg_holder and status_msg_holder[0]:
             try:
-                await status_msg.delete()
+                await status_msg_holder[0].delete()
             except Exception:
                 pass
 
@@ -286,40 +298,78 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await session_mgr.increment_message_count(user_id, prompt=message_text)
 
     # ── 5. Format and send response ───────────────────────
-    if not response_text or response_text == "ABORTED":
-        # Silent return for aborted, cancelled, or empty responses
+    # Fetch messages after prompt completes to get all multi-step assistant messages
+    response_texts = []
+    try:
+        after_messages = await oc_client.list_messages(session_id)
+        new_messages = [
+            m for m in after_messages
+            if m.get("info", {}).get("id") not in before_ids 
+            and m.get("info", {}).get("id") not in sent_message_ids
+            and m.get("info", {}).get("role") == "assistant"
+        ]
+        for m in new_messages:
+            parts = m.get("parts", [])
+            content_text = ""
+            if isinstance(parts, list):
+                text_parts = [
+                    p.get("text", "")
+                    for p in parts
+                    if isinstance(p, dict) and p.get("type") == "text"
+                ]
+                content_text = "".join(text_parts)
+            if content_text.strip():
+                response_texts.append(content_text)
+    except Exception as e:
+        logger.warning(f"Failed to fetch messages after prompt: {e}")
+
+    # Fallback to standard response if no intermediate texts were retrieved
+    all_responses = response_texts if response_texts else ([response_text] if response_text else [])
+
+    if not all_responses:
+        if response_text == "ABORTED":
+            return
+        # Send a user-friendly status message to prevent getting stuck silently
+        await update.message.reply_text(
+            "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
+            parse_mode="HTML"
+        )
         return
 
-    # Format OpenCode output for Telegram
-    formatted = format_opencode_response(response_text)
+    for resp in all_responses:
+        if not resp or resp == "ABORTED":
+            continue
 
-    # Split into chunks if too long
-    chunks = split_message(formatted, config.max_message_length)
+        # Format OpenCode output for Telegram
+        formatted = format_opencode_response(resp)
 
-    for i, chunk in enumerate(chunks):
-        try:
-            await update.message.reply_text(
-                chunk,
-                parse_mode="HTML",
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            # If HTML parsing fails, try sending as plain text
-            logger.warning(f"HTML parse failed for chunk {i+1}, falling back to plain text: {e}")
+        # Split into chunks if too long
+        chunks = split_message(formatted, config.max_message_length)
+
+        for i, chunk in enumerate(chunks):
             try:
-                # Strip HTML tags for plain text fallback
-                import re
-                plain = re.sub(r'<[^>]+>', '', chunk)
                 await update.message.reply_text(
-                    plain,
+                    chunk,
+                    parse_mode="HTML",
                     disable_web_page_preview=True,
                 )
-            except Exception as e2:
-                logger.error(f"Failed to send chunk {i+1} even as plain text: {e2}")
+            except Exception as e:
+                # If HTML parsing fails, try sending as plain text
+                logger.warning(f"HTML parse failed for chunk {i+1}, falling back to plain text: {e}")
+                try:
+                    # Strip HTML tags for plain text fallback
+                    import re
+                    plain = re.sub(r'<[^>]+>', '', chunk)
+                    await update.message.reply_text(
+                        plain,
+                        disable_web_page_preview=True,
+                    )
+                except Exception as e2:
+                    logger.error(f"Failed to send chunk {i+1} even as plain text: {e2}")
 
-        # Small delay between chunks to respect rate limits
-        if i < len(chunks) - 1:
-            await asyncio.sleep(0.5)
+            # Small delay between chunks to respect rate limits
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.5)
 
 
 async def _create_session(oc_client, user_id, session_mgr, config):
@@ -339,7 +389,10 @@ async def _create_session(oc_client, user_id, session_mgr, config):
     if not session_id:
         raise ValueError(f"OpenCode server response did not contain a session ID: {result}")
 
-    await session_mgr.set_active_session(user_id, session_id, config.opencode_model, work_dir=work_dir)
+    # Fetch user preferred model, falling back to config model
+    preferred_model = await session_mgr.get_user_preferred_model(user_id, config.opencode_model)
+
+    await session_mgr.set_active_session(user_id, session_id, preferred_model, work_dir=work_dir)
     return session_id
 
 
@@ -382,7 +435,7 @@ async def _listen_and_stream_events(
     session_id: str,
     server_url: str,
     is_streaming: bool,
-    status_msg = None
+    status_msg_holder = None
 ):
     """Listens to global OpenCode events via SSE and handles tool progress/permission requests."""
     import aiohttp
@@ -396,6 +449,7 @@ async def _listen_and_stream_events(
     notified_calls = set()
     completed_calls = set()
     last_update_time = [0.0]
+    last_status_text = ["🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>"]
 
     def truncate(text, max_len=500):
         if not text:
@@ -407,10 +461,11 @@ async def _listen_and_stream_events(
 
     async def update_status(text: str):
         now = time.time()
+        last_status_text[0] = text
         # Throttling to respect Telegram API rate limits (minimum 1.5 seconds between message edits)
-        if status_msg and (now - last_update_time[0] >= 1.5):
+        if status_msg_holder and status_msg_holder[0] and (now - last_update_time[0] >= 1.5):
             try:
-                await status_msg.edit_text(text, parse_mode="HTML")
+                await status_msg_holder[0].edit_text(text, parse_mode="HTML")
                 last_update_time[0] = now
             except Exception as e:
                 logger.debug(f"Failed to update status message: {e}")
@@ -434,14 +489,82 @@ async def _listen_and_stream_events(
                         if not isinstance(properties, dict):
                             continue
                         
-                        event_session_id = properties.get("sessionID", "")
+                        event_session_id = (
+                            properties.get("sessionID")
+                            or properties.get("sessionId")
+                            or properties.get("session_id")
+                            or payload.get("sessionID")
+                            or payload.get("sessionId")
+                            or payload.get("session_id")
+                            or ""
+                        )
                         if event_session_id != session_id:
                             continue
 
                         event_type = payload.get("type", "")
 
-                        # A. Handle Permission Requested Popup (Always Enabled)
-                        if event_type == "permission.asked":
+                        # A. Handle Intermediate Assistant Message Completion (Real-time Streaming)
+                        if event_type == "message.updated":
+                            info = properties.get("info", {})
+                            msg_id = info.get("id")
+                            role = info.get("role")
+                            completed = info.get("time", {}).get("completed")
+                            
+                            if role == "assistant" and completed:
+                                sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
+                                if msg_id not in sent_message_ids:
+                                    sent_message_ids.add(msg_id)
+                                    try:
+                                        oc_client = context.bot_data["opencode_client"]
+                                        messages = await oc_client.list_messages(session_id)
+                                        target_msg = next((m for m in messages if m.get("info", {}).get("id") == msg_id), None)
+                                        if target_msg:
+                                            parts = target_msg.get("parts", [])
+                                            content_text = ""
+                                            if isinstance(parts, list):
+                                                text_parts = [
+                                                    p.get("text", "")
+                                                    for p in parts
+                                                    if isinstance(p, dict) and p.get("type") == "text"
+                                                ]
+                                                content_text = "".join(text_parts)
+                                            
+                                            if content_text.strip():
+                                                # Delete the old status message at the top
+                                                if status_msg_holder and status_msg_holder[0]:
+                                                    try:
+                                                        await status_msg_holder[0].delete()
+                                                    except Exception:
+                                                        pass
+                                                    status_msg_holder[0] = None
+
+                                                from utils.formatting import format_opencode_response, split_message
+                                                formatted = format_opencode_response(content_text)
+                                                chunks = split_message(formatted, context.bot_data["config"].max_message_length)
+                                                for i, chunk in enumerate(chunks):
+                                                    await update.message.reply_text(
+                                                        chunk,
+                                                        parse_mode="HTML",
+                                                        disable_web_page_preview=True,
+                                                    )
+                                                    if i < len(chunks) - 1:
+                                                        await asyncio.sleep(0.5)
+
+                                                # Recreate the status indicator at the very bottom
+                                                if status_msg_holder:
+                                                    try:
+                                                        status_msg_holder[0] = await update.message.reply_text(
+                                                            last_status_text[0],
+                                                            parse_mode="HTML"
+                                                        )
+                                                        last_update_time[0] = time.time()
+                                                    except Exception as e:
+                                                        logger.warning(f"Failed to recreate status message at bottom: {e}")
+                                    except Exception as e:
+                                        logger.warning(f"Failed to stream intermediate message {msg_id}: {e}")
+
+                        # B. Handle Permission Requested Popup (Always Enabled)
+                        elif event_type == "permission.asked":
                             perm_id = properties.get("id") or properties.get("permissionID") or payload.get("id")
                             perm_type = properties.get("permission") or properties.get("type") or "execute"
                             patterns = properties.get("patterns", [])
@@ -514,7 +637,7 @@ async def _listen_and_stream_events(
                                     metadata = {}
 
                                 # ── 1. Update In-Place Status Message (Always Active) ──
-                                if status in ("pending", "running") and status_msg:
+                                if status in ("pending", "running") and status_msg_holder and status_msg_holder[0]:
                                     status_text = ""
                                     if tool_name == "bash":
                                         cmd = input_data.get("command") or input_data.get("content") or ""
@@ -734,6 +857,8 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "🧠 <b>Thinking...</b>\n<i>Analyzing request and preparing a plan...</i>",
             parse_mode="HTML"
         )
+        
+        status_msg_holder = [status_msg]
 
         sse_task = asyncio.create_task(
             _listen_and_stream_events(
@@ -742,7 +867,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 session_id=session_id,
                 server_url=config.opencode_server_url,
                 is_streaming=bool(is_streaming == 1),
-                status_msg=status_msg
+                status_msg_holder=status_msg_holder
             )
         )
 
@@ -750,9 +875,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             _keep_typing(update, config.response_timeout)
         )
 
+        before_ids = set()
+        sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
+        sent_message_ids.clear()
         try:
             session_info = await session_mgr.get_session_info(user_id)
             session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+
+            # Fetch message IDs before sending the prompt
+            try:
+                before_messages = await oc_client.list_messages(session_id)
+                before_ids = {m.get("info", {}).get("id") for m in before_messages if m.get("info", {}).get("id")}
+            except Exception as e:
+                logger.warning(f"Failed to fetch messages before document prompt: {e}")
 
             response_text = await _send_to_opencode(
                 oc_client=oc_client,
@@ -765,9 +900,54 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             await session_mgr.increment_message_count(user_id, prompt=caption)
 
             # Send response back to user
-            if response_text and response_text != "ABORTED":
-                formatted = format_opencode_response(response_text)
+            # Fetch messages after prompt completes to get all multi-step assistant messages
+            response_texts = []
+            try:
+                after_messages = await oc_client.list_messages(session_id)
+                new_messages = [
+                    m for m in after_messages
+                    if m.get("info", {}).get("id") not in before_ids 
+                    and m.get("info", {}).get("id") not in sent_message_ids
+                    and m.get("info", {}).get("role") == "assistant"
+                ]
+                for m in new_messages:
+                    parts = m.get("parts", [])
+                    content_text = ""
+                    if isinstance(parts, list):
+                        text_parts = [
+                            p.get("text", "")
+                            for p in parts
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ]
+                        content_text = "".join(text_parts)
+                    if content_text.strip():
+                        response_texts.append(content_text)
+            except Exception as e:
+                logger.warning(f"Failed to fetch messages after document prompt: {e}")
+
+            # Fallback to standard response if no intermediate texts were retrieved
+            all_responses = response_texts if response_texts else ([response_text] if response_text else [])
+
+            if not all_responses:
+                if response_text == "ABORTED":
+                    return
+                # Send a user-friendly status message to prevent getting stuck silently
+                await update.message.reply_text(
+                    "ℹ️ <b>OpenCode finished execution.</b>\n<i>(No conversational text response was returned)</i>",
+                    parse_mode="HTML"
+                )
+                return
+
+            for resp in all_responses:
+                if not resp or resp == "ABORTED":
+                    continue
+
+                # Format OpenCode output for Telegram
+                formatted = format_opencode_response(resp)
+
+                # Split into chunks if too long
                 chunks = split_message(formatted, config.max_message_length)
+
                 for i, chunk in enumerate(chunks):
                     try:
                         await update.message.reply_text(
@@ -796,9 +976,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 typing_task.cancel()
             if sse_task:
                 sse_task.cancel()
-            if status_msg:
+            if status_msg_holder and status_msg_holder[0]:
                 try:
-                    await status_msg.delete()
+                    await status_msg_holder[0].delete()
                 except Exception:
                     pass
 

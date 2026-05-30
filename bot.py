@@ -19,6 +19,10 @@ import logging
 import sys
 import os
 
+# Switch to Selector Event Loop on Windows for robust signal handling and clean shutdowns
+if sys.platform == 'win32':
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -66,6 +70,43 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stderr)],
 )
 logger = logging.getLogger("opencode-telegram-bot")
+
+_lock_file = None
+
+def acquire_bot_lock():
+    """Acquire an exclusive lock file to prevent multiple instances from running concurrently."""
+    global _lock_file
+    lock_path = os.path.join(os.path.abspath("."), "bot.lock")
+    try:
+        _lock_file = open(lock_path, "w")
+        if os.name == 'nt':
+            import msvcrt
+            try:
+                _lock_file.seek(0)
+                msvcrt.locking(_lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                _lock_file.write(str(os.getpid()))
+                _lock_file.flush()
+            except (OSError, IOError):
+                print("\n" + "="*65)
+                print("❌ ERROR: Another instance of the Telegram bot is already running!")
+                print("Please close the other terminal or kill the stray Python process.")
+                print("="*65 + "\n")
+                sys.exit(1)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(_lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                _lock_file.write(str(os.getpid()))
+                _lock_file.flush()
+            except (OSError, IOError):
+                print("\n" + "="*65)
+                print("❌ ERROR: Another instance of the Telegram bot is already running!")
+                print("Please close the other terminal or kill the stray Python process.")
+                print("="*65 + "\n")
+                sys.exit(1)
+    except Exception as e:
+        logger.warning(f"Could not acquire bot lock: {e}")
+
 
 
 class RetryingHTTPXRequest(HTTPXRequest):
@@ -198,8 +239,17 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Log the error and send a Telegram message to notify the user."""
-    # Log the error with traceback
-    logger.error("Exception while handling an update:", exc_info=context.error)
+    # Suppress full traceback for common transient network / timeout errors to keep logs clean
+    from telegram.error import NetworkError, TimedOut
+    
+    err = context.error
+    err_str = str(err).lower()
+    if isinstance(err, (NetworkError, TimedOut)) or "httpx" in err_str or "httpcore" in err_str or "read error" in err_str:
+        logger.warning(f"📡 Transient Telegram network/timeout error: {err}")
+        return
+
+    # Log unexpected errors with traceback
+    logger.error("Exception while handling an update:", exc_info=err)
 
     # Notify the user if the update is a Telegram Update with a message
     if isinstance(update, Update) and update.effective_message:
@@ -233,19 +283,25 @@ async def post_shutdown(application) -> None:
     # Stop the background opencode server process if running
     try:
         from opencode.server import stop_server
-        await stop_server()
+        await asyncio.wait_for(stop_server(), timeout=8.0)
     except Exception as e:
         logger.warning(f"Failed to stop background OpenCode server: {e}")
 
     # Close session manager DB
     session_mgr = application.bot_data.get("session_manager")
     if session_mgr:
-        await session_mgr.close()
+        try:
+            await asyncio.wait_for(session_mgr.close(), timeout=3.0)
+        except Exception as e:
+            logger.warning(f"Failed to close session manager: {e}")
 
     # Close HTTP client
     oc_client = application.bot_data.get("opencode_client")
     if oc_client:
-        await oc_client.close()
+        try:
+            await asyncio.wait_for(oc_client.close(), timeout=3.0)
+        except Exception as e:
+            logger.warning(f"Failed to close HTTP client: {e}")
 
     logger.info("Goodbye!")
 
@@ -412,6 +468,9 @@ def main():
         logger.error("Copy .env.example → .env and fill in your values.")
         sys.exit(1)
 
+    # ── Acquire exclusive bot lock to prevent concurrent instances ───────
+    acquire_bot_lock()
+
     logger.info("=" * 50)
     logger.info("  OpenCode Telegram Bot")
     logger.info("=" * 50)
@@ -447,6 +506,7 @@ def main():
         ApplicationBuilder()
         .token(config.telegram_bot_token)
         .request(request)
+        .get_updates_request(request)
         .post_init(post_init)
         .post_shutdown(post_shutdown)
         .build()

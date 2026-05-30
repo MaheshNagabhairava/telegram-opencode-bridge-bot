@@ -274,6 +274,20 @@ class OpenCodeClient:
             return result.get("sessions", result.get("data", []))
         return []
 
+    async def list_messages(self, session_id: str) -> List[Dict[str, Any]]:
+        """List all messages in an OpenCode session.
+
+        Parameters:
+            session_id: The session identifier.
+
+        Returns:
+            A list of message dictionaries.
+        """
+        result = await self._request("GET", f"/session/{session_id}/message")
+        if isinstance(result, list):
+            return result
+        return []
+
     async def create_session(self, directory: Optional[str] = None) -> Dict[str, Any]:
         """Create a new OpenCode session.
 

@@ -103,34 +103,37 @@ async def stop_server() -> None:
     # Also kill any stray opencode serve processes on our port
     if platform.system() == "Windows":
         try:
-            # Query netstat to find process ID listening on the port
-            cmd = f'netstat -ano | findstr LISTENING | findstr :{_server_port}'
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL
+            # Query netstat to find process ID listening on the port synchronously
+            proc = subprocess.run(
+                f'netstat -ano | findstr LISTENING | findstr :{_server_port}',
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5
             )
-            stdout, _ = await proc.communicate()
-            lines = stdout.decode().strip().split('\n')
+            stdout = proc.stdout
+            lines = stdout.strip().split('\n')
             for line in lines:
                 parts = line.strip().split()
                 if len(parts) >= 5:
                     pid = parts[-1]
                     if pid.isdigit() and int(pid) > 0:
-                        os.system(f"taskkill /F /T /PID {pid}")
+                        subprocess.run(f"taskkill /F /T /PID {pid}", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
                         logger.info(f"Killed stray Windows PID={pid} on port {_server_port}")
         except Exception as e:
             logger.warning(f"Failed to kill stray Windows process: {e}")
     else:
-        # Unix lsof implementation
+        # Unix lsof implementation synchronously
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "lsof", "-ti", f":{_server_port}", "-sTCP:LISTEN",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+            proc = subprocess.run(
+                ["lsof", "-ti", f":{_server_port}", "-sTCP:LISTEN"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=5
             )
-            stdout, _ = await proc.communicate()
-            pids = stdout.decode().strip().split()
+            pids = proc.stdout.strip().split()
             for pid in pids:
                 if pid.isdigit():
                     try:

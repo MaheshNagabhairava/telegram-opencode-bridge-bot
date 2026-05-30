@@ -828,7 +828,9 @@ async def execute_project_switch(update_or_query, context: ContextTypes.DEFAULT_
             if not session_id:
                 raise ValueError("Response did not contain a session ID.")
 
-            await session_mgr.set_active_session(user_id, session_id, config.opencode_model, work_dir=target_path)
+            # Fetch user preferred model, falling back to config model
+            preferred_model = await session_mgr.get_user_preferred_model(user_id, config.opencode_model)
+            await session_mgr.set_active_session(user_id, session_id, preferred_model, work_dir=target_path)
 
             await update_status(
                 f"🔄 <b>Switched project to:</b> <code>{html.escape(target_folder)}</code>\n"

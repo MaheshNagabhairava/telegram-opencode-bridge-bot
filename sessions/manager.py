@@ -65,6 +65,11 @@ class SessionManager:
             await self._db.execute("ALTER TABLE user_settings ADD COLUMN streaming INTEGER DEFAULT 0")
         except aiosqlite.OperationalError:
             pass
+
+        try:
+            await self._db.execute("ALTER TABLE user_settings ADD COLUMN model TEXT DEFAULT ''")
+        except aiosqlite.OperationalError:
+            pass
             
         await self._db.execute("""  
             CREATE INDEX IF NOT EXISTS idx_user_active 
@@ -174,7 +179,11 @@ class SessionManager:
             await self._db.commit()
     
     async def set_model(self, user_id: int, model: str) -> None:
-        """Set the model for a user's active session."""
+        """Set the model for a user's active session and also save as preferred settings."""
+        # 1. Save in user_settings
+        await self.set_user_preferred_model(user_id, model)
+        
+        # 2. Update active session if exists
         if user_id in self._active_sessions:
             self._active_sessions[user_id]["model"] = model
             await self._db.execute(
@@ -182,6 +191,27 @@ class SessionManager:
                 (model, user_id)
             )
             await self._db.commit()
+
+    async def get_user_preferred_model(self, user_id: int, default_model: str) -> str:
+        """Get the preferred model for a specific user, falling back to default."""
+        async with self._db.execute(
+            "SELECT model FROM user_settings WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+        return default_model
+
+    async def set_user_preferred_model(self, user_id: int, model: str) -> None:
+        """Save or update the preferred model for a user in their settings."""
+        await self._db.execute(
+            "INSERT INTO user_settings (user_id, work_dir, model) VALUES (?, '', ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET model = excluded.model",
+            (user_id, model)
+        )
+        await self._db.commit()
+        logger.info(f"Set preferred model for user {user_id}: {model}")
     
     async def clear_session(self, user_id: int) -> None:
         """Deactivate the current session for a user (they'll get a new one on next message)."""

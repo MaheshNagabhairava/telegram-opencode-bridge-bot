@@ -35,7 +35,9 @@ def format_opencode_response(text: str) -> str:
                 formatted_parts.append(f'<pre>{escaped}</pre>')
         else:
             # Regular text — convert markdown to HTML
-            formatted_parts.append(_markdown_to_html(content))
+            html_converted = _markdown_to_html(content)
+            # Parse and convert markdown tables inside the HTML-converted text
+            formatted_parts.append(_convert_markdown_tables(html_converted))
     
     return "\n".join(formatted_parts)
 
@@ -96,6 +98,154 @@ def _markdown_to_html(text: str) -> str:
     text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2">\1</a>', text)
     
     return text
+
+
+def _convert_markdown_tables(text: str) -> str:
+    """Detect and convert Markdown tables to Telegram-friendly HTML cards or lists."""
+    lines = text.split("\n")
+    processed_lines = []
+    
+    in_table = False
+    table_headers = []
+    table_rows = []
+    
+    def flush_table():
+        nonlocal in_table, table_headers, table_rows
+        if not table_headers:
+            in_table = False
+            table_rows = []
+            return []
+        
+        formatted_table = []
+        num_cols = len(table_headers)
+        
+        if num_cols == 2:
+            # 2 Columns (Checklist / Key-Value Card)
+            header_left = table_headers[0].strip()
+            header_right = table_headers[1].strip()
+            
+            # Strip tags for clean header title
+            h_left_raw = re.sub(r'<[^>]+>', '', header_left).strip()
+            formatted_table.append(f"<b>📋 {h_left_raw}</b>\n")
+            
+            for row in table_rows:
+                if len(row) >= 2:
+                    key = row[0].strip()
+                    val = row[1].strip()
+                    
+                    # Strip any redundant bold tags from key for clean styling
+                    clean_key = key
+                    if clean_key.startswith("<b>") and clean_key.endswith("</b>"):
+                        clean_key = clean_key[3:-4]
+                        
+                    formatted_table.append(f"• <b>{clean_key}:</b> {val}")
+            formatted_table.append("") # Empty line after table
+            
+        else:
+            # 3+ Columns (API Card Layout)
+            method_idx = -1
+            path_idx = -1
+            other_idxs = []
+            
+            for idx, h in enumerate(table_headers):
+                h_clean = h.strip().lower()
+                h_raw = re.sub(r'<[^>]+>', '', h_clean)
+                if "method" in h_raw:
+                    method_idx = idx
+                elif "path" in h_raw or "endpoint" in h_raw:
+                    path_idx = idx
+                else:
+                    other_idxs.append(idx)
+            
+            for row in table_rows:
+                method_val = row[method_idx].strip() if method_idx >= 0 and method_idx < len(row) else ""
+                path_val = row[path_idx].strip() if path_idx >= 0 and path_idx < len(row) else ""
+                
+                # Clean method and path from any HTML tags
+                method_raw = re.sub(r'<[^>]+>', '', method_val).upper().strip()
+                path_raw = re.sub(r'<[^>]+>', '', path_val).strip()
+                
+                # Format method badge with colored emojis
+                method_html = ""
+                if method_raw:
+                    emoji = "⚪"
+                    if "GET" in method_raw and "POST" in method_raw:
+                        emoji = "🟢/🔵"
+                    elif "GET" in method_raw:
+                        emoji = "🟢"
+                    elif "POST" in method_raw:
+                        emoji = "🔵"
+                    elif "PUT" in method_raw:
+                        emoji = "🟡"
+                    elif "DELETE" in method_raw:
+                        emoji = "🔴"
+                    elif "PATCH" in method_raw:
+                        emoji = "🟣"
+                    
+                    method_html = f"{emoji} <b>{method_raw}</b>"
+                
+                # Format path in monospaced code blocks
+                path_html = ""
+                if path_raw:
+                    path_html = f" <code>{path_raw}</code>"
+                
+                card_title = f"{method_html}{path_html}".strip()
+                if card_title:
+                    formatted_table.append(card_title)
+                
+                # Add other columns as key-value bullets under this card
+                for idx in other_idxs:
+                    if idx < len(row):
+                        col_name = table_headers[idx].strip()
+                        col_val = row[idx].strip()
+                        
+                        col_name_raw = re.sub(r'<[^>]+>', '', col_name).strip()
+                        
+                        if col_val:
+                            formatted_table.append(f"• <b>{col_name_raw}:</b> {col_val}")
+                
+                formatted_table.append("") # Empty line between cards
+                
+        # Reset state
+        in_table = False
+        table_headers = []
+        table_rows = []
+        
+        return formatted_table
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        line_stripped = line.strip()
+        
+        if line_stripped.startswith("|"):
+            cells = [c.strip() for c in line_stripped.split("|")[1:-1]]
+            
+            is_separator = False
+            if cells:
+                is_separator = all(re.match(r'^:?-+:?$', c) for c in cells)
+                
+            if is_separator:
+                i += 1
+                continue
+                
+            if not in_table:
+                in_table = True
+                table_headers = cells
+            else:
+                table_rows.append(cells)
+        else:
+            if in_table:
+                processed_lines.extend(flush_table())
+            processed_lines.append(line)
+            
+        i += 1
+        
+    if in_table:
+        processed_lines.extend(flush_table())
+        
+    return "\n".join(processed_lines)
+
 
 
 def split_message(text: str, max_length: int = DEFAULT_MAX_LENGTH) -> List[str]:
