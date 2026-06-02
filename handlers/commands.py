@@ -1186,27 +1186,27 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     is_git = os.path.exists(".git")
     
-    def run_cmd_sync(command: str) -> tuple[int, str, str]:
-        """Helper to run a shell command synchronously."""
+    def run_cmd_sync(command: list[str]) -> tuple[int, str, str]:
+        """Helper to run a command synchronously."""
         import subprocess
         proc = subprocess.run(
             command,
-            shell=True,
+            shell=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
         )
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
-    async def run_cmd(command: str) -> tuple[int, str, str]:
-        """Helper to run a shell command in a background thread."""
+    async def run_cmd(command: list[str]) -> tuple[int, str, str]:
+        """Helper to run a command in a background thread."""
         return await asyncio.to_thread(run_cmd_sync, command)
 
     if is_git:
         await update_status("🔍 <b>Detected Git installation. Fetching remote changes...</b>")
         
         # 1. Git fetch
-        code, stdout, stderr = await run_cmd("git fetch origin")
+        code, stdout, stderr = await run_cmd(["git", "fetch", "origin"])
         if code != 0:
             await update_status(
                 f"❌ <b>Git fetch failed:</b>\n"
@@ -1215,8 +1215,8 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
 
         # 2. Check diff
-        code_local, local_hash, _ = await run_cmd("git rev-parse HEAD")
-        code_remote, remote_hash, _ = await run_cmd("git rev-parse @{u}")
+        code_local, local_hash, _ = await run_cmd(["git", "rev-parse", "HEAD"])
+        code_remote, remote_hash, _ = await run_cmd(["git", "rev-parse", "@{u}"])
         
         if code_local != 0 or code_remote != 0:
             await update_status("❌ <b>Failed to resolve Git commit hashes.</b>")
@@ -1232,7 +1232,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update_status("🔄 <b>New updates found. Pulling latest code changes...</b>")
         
         # 3. Git pull
-        code_pull, pull_stdout, pull_stderr = await run_cmd("git pull")
+        code_pull, pull_stdout, pull_stderr = await run_cmd(["git", "pull"])
         if code_pull != 0:
             await update_status(
                 f"❌ <b>Git pull failed:</b>\n"
@@ -1243,14 +1243,14 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # 4. Pip install requirements if updated
         if os.path.exists("requirements.txt"):
             await update_status("📦 <b>Updating dependencies from requirements.txt...</b>")
-            await run_cmd(f"{sys.executable} -m pip install -r requirements.txt")
+            await run_cmd([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"])
 
     else:
         # Pip package installation
         await update_status("🔍 <b>Detected Pip installation. Checking PyPI for updates...</b>")
         
         # Run pip install --upgrade
-        code, stdout, stderr = await run_cmd(f"{sys.executable} -m pip install --upgrade telegram-opencode-bridge-bot")
+        code, stdout, stderr = await run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "telegram-opencode-bridge-bot"])
         if code != 0:
             await update_status(
                 f"❌ <b>Pip upgrade failed:</b>\n"
