@@ -1310,19 +1310,31 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 pass
                 
             import subprocess
-            creationflags = 0x00000008  # DETACHED_PROCESS
+            # Use CREATE_NO_WINDOW (0x08000000) so the process runs silently in the background
+            # without spawning a separate visible Command Prompt window that closes on exit.
+            creationflags = 0x08000000  # CREATE_NO_WINDOW
             
             updater_code = (
                 "import time, subprocess, sys, os\n"
                 "pid = int(sys.argv[1])\n"
-                "while True:\n"
-                "    try:\n"
-                "        os.kill(pid, 0)\n"
-                "    except OSError:\n"
-                "        break\n"
-                "    time.sleep(0.5)\n"
-                "subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', 'telegram-opencode-bridge-bot'])\n"
-                "subprocess.Popen(sys.argv[2:])\n"
+                "with open('updater.log', 'w', encoding='utf-8') as f:\n"
+                "    f.write('Waiting for parent process to exit...\\n')\n"
+                "    f.flush()\n"
+                "    while True:\n"
+                "        try:\n"
+                "            os.kill(pid, 0)\n"
+                "        except OSError:\n"
+                "            break\n"
+                "        time.sleep(0.5)\n"
+                "    f.write('Parent exited. Upgrading telegram-opencode-bridge-bot...\\n')\n"
+                "    f.flush()\n"
+                "    res = subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', 'telegram-opencode-bridge-bot'], stdout=f, stderr=f)\n"
+                "    f.write(f'Pip upgrade finished with exit code: {res.returncode}\\n')\n"
+                "    f.write('Restarting bot...\\n')\n"
+                "    f.flush()\n"
+                "    # Start bot with CREATE_NO_WINDOW as a detached background daemon\n"
+                "    subprocess.Popen(sys.argv[2:], creationflags=0x08000000)\n"
+                "    f.write('Bot successfully spawned. Exiting updater.\\n')\n"
             )
             
             subprocess.Popen(
