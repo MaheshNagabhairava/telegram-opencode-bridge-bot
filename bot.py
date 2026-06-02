@@ -60,6 +60,7 @@ from handlers.commands import (
     enable_command,
     disable_command,
     history_command,
+    update_command,
     set_bot_commands,
     callback_handler,
 )
@@ -211,6 +212,10 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
     async def _history(update, context):
         await history_command(update, context)
 
+    @authorized(authorizer, rate_limiter)
+    async def _update(update, context):
+        await update_command(update, context)
+
     @authorized(authorizer)
     async def _callback(update, context):
         await callback_handler(update, context)
@@ -237,6 +242,7 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "enable": _enable,
         "disable": _disable,
         "history": _history,
+        "update": _update,
         "plan": _plan,
         "build": _build,
         "mode": _mode,
@@ -550,6 +556,7 @@ def main():
     application.add_handler(CommandHandler("enable", handlers["enable"], block=False))
     application.add_handler(CommandHandler("disable", handlers["disable"], block=False))
     application.add_handler(CommandHandler("history", handlers["history"], block=False))
+    application.add_handler(CommandHandler("update", handlers["update"], block=False))
     application.add_handler(CommandHandler("mode", handlers["mode"], block=False))
     application.add_handler(CommandHandler("plan", handlers["plan"], block=False))
     application.add_handler(CommandHandler("build", handlers["build"], block=False))

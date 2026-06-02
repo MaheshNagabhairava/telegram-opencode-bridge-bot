@@ -450,7 +450,9 @@ async def _listen_and_stream_events(
     is_streaming: bool,
     status_msg_holder = None
 ):
-    """Listens to global OpenCode events via SSE and handles tool progress/permission requests."""
+    """Listens to global OpenCode events via SSE and handles tool progress/permission requests.
+    Includes an automatic reconnect loop with exponential back-off to prevent getting stuck.
+    """
     import aiohttp
     import json
     import html
@@ -483,261 +485,273 @@ async def _listen_and_stream_events(
             except Exception as e:
                 logger.debug(f"Failed to update status message: {e}")
 
-    async with aiohttp.ClientSession(read_bufsize=100 * 1024 * 1024) as sse_session:
+    retry_delay = 1.0
+    while True:
         try:
-            async with sse_session.get(url, headers={"Accept": "text/event-stream"}) as resp:
-                async for line in resp.content:
-                    line_str = line.decode('utf-8').strip()
-                    if not line_str or not line_str.startswith("data:"):
-                        continue
+            async with aiohttp.ClientSession(read_bufsize=100 * 1024 * 1024) as sse_session:
+                async with sse_session.get(url, headers={"Accept": "text/event-stream"}) as resp:
+                    # Connection successful, reset retry delay
+                    retry_delay = 1.0
                     
-                    data_content = line_str[5:].strip()
-                    try:
-                        event_obj = json.loads(data_content)
-                        payload = event_obj.get("payload", {})
-                        if not isinstance(payload, dict):
+                    async for line in resp.content:
+                        line_str = line.decode('utf-8').strip()
+                        if not line_str or not line_str.startswith("data:"):
                             continue
                         
-                        properties = payload.get("properties", {})
-                        if not isinstance(properties, dict):
-                            continue
-                        
-                        event_session_id = (
-                            properties.get("sessionID")
-                            or properties.get("sessionId")
-                            or properties.get("session_id")
-                            or payload.get("sessionID")
-                            or payload.get("sessionId")
-                            or payload.get("session_id")
-                            or ""
-                        )
-                        if event_session_id != session_id:
-                            continue
-
-                        event_type = payload.get("type", "")
-
-                        # A. Handle Intermediate Assistant Message Completion (Real-time Streaming)
-                        if event_type == "message.updated":
-                            info = properties.get("info", {})
-                            msg_id = info.get("id")
-                            role = info.get("role")
-                            completed = info.get("time", {}).get("completed")
+                        data_content = line_str[5:].strip()
+                        try:
+                            event_obj = json.loads(data_content)
+                            payload = event_obj.get("payload", {})
+                            if not isinstance(payload, dict):
+                                continue
                             
-                            if role == "assistant" and completed:
-                                sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
-                                if msg_id not in sent_message_ids:
-                                    sent_message_ids.add(msg_id)
-                                    try:
-                                        oc_client = context.bot_data["opencode_client"]
-                                        messages = await oc_client.list_messages(session_id)
-                                        target_msg = next((m for m in messages if m.get("info", {}).get("id") == msg_id), None)
-                                        if target_msg:
-                                            parts = target_msg.get("parts", [])
-                                            content_text = ""
-                                            if isinstance(parts, list):
-                                                text_parts = [
-                                                    p.get("text", "")
-                                                    for p in parts
-                                                    if isinstance(p, dict) and p.get("type") == "text"
-                                                ]
-                                                content_text = "".join(text_parts)
-                                            
-                                            if content_text.strip():
-                                                # Delete the old status message at the top
-                                                if status_msg_holder and status_msg_holder[0]:
-                                                    try:
-                                                        await status_msg_holder[0].delete()
-                                                    except Exception:
-                                                        pass
-                                                    status_msg_holder[0] = None
+                            properties = payload.get("properties", {})
+                            if not isinstance(properties, dict):
+                                continue
+                            
+                            event_session_id = (
+                                properties.get("sessionID")
+                                or properties.get("sessionId")
+                                or properties.get("session_id")
+                                or payload.get("sessionID")
+                                or payload.get("sessionId")
+                                or payload.get("session_id")
+                                or ""
+                            )
+                            if event_session_id != session_id:
+                                continue
 
-                                                from utils.formatting import format_opencode_response, split_message
-                                                formatted = format_opencode_response(content_text)
-                                                chunks = split_message(formatted, context.bot_data["config"].max_message_length)
-                                                for i, chunk in enumerate(chunks):
-                                                    await update.message.reply_text(
-                                                        chunk,
-                                                        parse_mode="HTML",
-                                                        disable_web_page_preview=True,
-                                                    )
-                                                    if i < len(chunks) - 1:
-                                                        await asyncio.sleep(0.5)
+                            event_type = payload.get("type", "")
 
-                                                # Recreate the status indicator at the very bottom
-                                                if status_msg_holder:
-                                                    try:
-                                                        status_msg_holder[0] = await update.message.reply_text(
-                                                            last_status_text[0],
-                                                            parse_mode="HTML"
+                            # A. Handle Intermediate Assistant Message Completion (Real-time Streaming)
+                            if event_type == "message.updated":
+                                info = properties.get("info", {})
+                                msg_id = info.get("id")
+                                role = info.get("role")
+                                completed = info.get("time", {}).get("completed")
+                                
+                                if role == "assistant" and completed:
+                                    sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
+                                    if msg_id not in sent_message_ids:
+                                        sent_message_ids.add(msg_id)
+                                        try:
+                                            oc_client = context.bot_data["opencode_client"]
+                                            messages = await oc_client.list_messages(session_id)
+                                            target_msg = next((m for m in messages if m.get("info", {}).get("id") == msg_id), None)
+                                            if target_msg:
+                                                parts = target_msg.get("parts", [])
+                                                content_text = ""
+                                                if isinstance(parts, list):
+                                                    text_parts = [
+                                                        p.get("text", "")
+                                                        for p in parts
+                                                        if isinstance(p, dict) and p.get("type") == "text"
+                                                    ]
+                                                    content_text = "".join(text_parts)
+                                                
+                                                if content_text.strip():
+                                                    # Delete the old status message at the top
+                                                    if status_msg_holder and status_msg_holder[0]:
+                                                        try:
+                                                            await status_msg_holder[0].delete()
+                                                        except Exception:
+                                                            pass
+                                                        status_msg_holder[0] = None
+
+                                                    from utils.formatting import format_opencode_response, split_message
+                                                    formatted = format_opencode_response(content_text)
+                                                    chunks = split_message(formatted, context.bot_data["config"].max_message_length)
+                                                    for i, chunk in enumerate(chunks):
+                                                        await update.message.reply_text(
+                                                            chunk,
+                                                            parse_mode="HTML",
+                                                            disable_web_page_preview=True,
                                                         )
-                                                        last_update_time[0] = time.time()
-                                                    except Exception as e:
-                                                        logger.warning(f"Failed to recreate status message at bottom: {e}")
-                                    except Exception as e:
-                                        logger.warning(f"Failed to stream intermediate message {msg_id}: {e}")
+                                                        if i < len(chunks) - 1:
+                                                            await asyncio.sleep(0.5)
 
-                        # B. Handle Permission Requested Popup (Always Enabled)
-                        elif event_type == "permission.asked":
-                            perm_id = properties.get("id") or properties.get("permissionID") or payload.get("id")
-                            perm_type = properties.get("permission") or properties.get("type") or "execute"
-                            patterns = properties.get("patterns", [])
+                                                    # Recreate the status indicator at the very bottom
+                                                    if status_msg_holder:
+                                                        try:
+                                                            status_msg_holder[0] = await update.message.reply_text(
+                                                                last_status_text[0],
+                                                                parse_mode="HTML"
+                                                            )
+                                                            last_update_time[0] = time.time()
+                                                        except Exception as e:
+                                                            logger.warning(f"Failed to recreate status message at bottom: {e}")
+                                        except Exception as e:
+                                            logger.warning(f"Failed to stream intermediate message {msg_id}: {e}")
 
-                            if not perm_id:
-                                logger.warning("Received permission.asked event but no permission ID was found.")
-                                continue
+                            # B. Handle Permission Requested Popup (Always Enabled)
+                            elif event_type == "permission.asked":
+                                perm_id = properties.get("id") or properties.get("permissionID") or payload.get("id")
+                                perm_type = properties.get("permission") or properties.get("type") or "execute"
+                                patterns = properties.get("patterns", [])
 
-                            # Register pending permission in-memory lookup to avoid Telegram 64-char callback limit
-                            if "pending_permissions" not in context.bot_data:
-                                context.bot_data["pending_permissions"] = {}
+                                if not perm_id:
+                                    logger.warning("Received permission.asked event but no permission ID was found.")
+                                    continue
 
-                            short_key = uuid.uuid4().hex[:8]
-                            context.bot_data["pending_permissions"][short_key] = {
-                                "session_id": session_id,
-                                "permission_id": perm_id
-                            }
+                                # Register pending permission in-memory lookup to avoid Telegram 64-char callback limit
+                                if "pending_permissions" not in context.bot_data:
+                                    context.bot_data["pending_permissions"] = {}
 
-                            patterns_text = ""
-                            if patterns:
-                                pat_list = "\n".join([f"• <code>{html.escape(str(p))}</code>" for p in patterns])
-                                patterns_text = f"\n<b>Target Resource(s):</b>\n{pat_list}"
+                                short_key = uuid.uuid4().hex[:8]
+                                context.bot_data["pending_permissions"][short_key] = {
+                                    "session_id": session_id,
+                                    "permission_id": perm_id
+                                }
 
-                            tool_name = ""
-                            tool_info = properties.get("tool", {})
-                            if isinstance(tool_info, dict):
-                                tool_name = tool_info.get("name", "")
-                            if not tool_name:
-                                tool_name = perm_type
+                                patterns_text = ""
+                                if patterns:
+                                    pat_list = "\n".join([f"• <code>{html.escape(str(p))}</code>" for p in patterns])
+                                    patterns_text = f"\n<b>Target Resource(s):</b>\n{pat_list}"
 
-                            msg = (
-                                f"🛡️ <b>OpenCode Permission Requested</b>\n\n"
-                                f"The agent is asking for confirmation to use the tool <code>{html.escape(tool_name)}</code>.\n"
-                                f"{patterns_text}\n\n"
-                                f"Do you want to allow this operation?"
-                            )
+                                tool_name = ""
+                                tool_info = properties.get("tool", {})
+                                if isinstance(tool_info, dict):
+                                    tool_name = tool_info.get("name", "")
+                                if not tool_name:
+                                    tool_name = perm_type
 
-                            keyboard = [
-                                [
-                                    InlineKeyboardButton("✅ Yes, Allow", callback_data=f"perm:allow:{short_key}"),
-                                    InlineKeyboardButton("❌ No, Deny", callback_data=f"perm:deny:{short_key}")
+                                msg = (
+                                    f"🛡️ <b>OpenCode Permission Requested</b>\n\n"
+                                    f"The agent is asking for confirmation to use the tool <code>{html.escape(tool_name)}</code>.\n"
+                                    f"{patterns_text}\n\n"
+                                    f"Do you want to allow this operation?"
+                                )
+
+                                keyboard = [
+                                    [
+                                        InlineKeyboardButton("✅ Yes, Allow", callback_data=f"perm:allow:{short_key}"),
+                                        InlineKeyboardButton("❌ No, Deny", callback_data=f"perm:deny:{short_key}")
+                                    ]
                                 ]
-                            ]
 
-                            await update.message.reply_text(
-                                msg,
-                                parse_mode="HTML",
-                                reply_markup=InlineKeyboardMarkup(keyboard)
-                            )
+                                await update.message.reply_text(
+                                    msg,
+                                    parse_mode="HTML",
+                                    reply_markup=InlineKeyboardMarkup(keyboard)
+                                )
 
-                        # B. Handle Tool Execution Progress
-                        elif event_type == "message.part.updated":
-                            part = properties.get("part", {})
-                            if not isinstance(part, dict):
-                                continue
-                            
-                            part_type = part.get("type", "")
-                            if part_type == "tool":
-                                tool_name = part.get("tool", "unknown")
-                                call_id = part.get("callID", "unknown")
-                                state = part.get("state", {})
-                                if not isinstance(state, dict):
+                            # B. Handle Tool Execution Progress
+                            elif event_type == "message.part.updated":
+                                part = properties.get("part", {})
+                                if not isinstance(part, dict):
                                     continue
                                 
-                                status = state.get("status", "")
-                                input_data = state.get("input", {})
-                                output_data = state.get("output", "")
-                                metadata = state.get("metadata", {})
-                                if not isinstance(metadata, dict):
-                                    metadata = {}
-
-                                # ── 1. Update In-Place Status Message (Always Active) ──
-                                if status in ("pending", "running") and status_msg_holder and status_msg_holder[0]:
-                                    status_text = ""
-                                    if tool_name == "bash":
-                                        cmd = input_data.get("command") or input_data.get("content") or ""
-                                        cmd_truncated = truncate(cmd, 60)
-                                        status_text = f"💻 <b>Running shell command...</b>\n<code>{html.escape(cmd_truncated)}</code>"
-                                    elif tool_name in ("edit", "write", "save"):
-                                        path = input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
-                                        path_truncated = truncate(os.path.basename(path) if path else "", 60)
-                                        status_text = f"📝 <b>Modifying file...</b>\n<code>{html.escape(path_truncated)}</code>"
-                                    elif tool_name in ("read", "view", "show"):
-                                        path = input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
-                                        path_truncated = truncate(os.path.basename(path) if path else "", 60)
-                                        status_text = f"🔍 <b>Reading file...</b>\n<code>{html.escape(path_truncated)}</code>"
-                                    elif tool_name in ("webfetch", "websearch", "search"):
-                                        query = input_data.get("query") or input_data.get("url") or ""
-                                        query_truncated = truncate(query, 60)
-                                        status_text = f"🌐 <b>Searching web...</b>\n<code>{html.escape(query_truncated)}</code>"
-                                    else:
-                                        status_text = f"⚙️ <b>Executing tool <code>{html.escape(tool_name)}</code>...</b>"
+                                part_type = part.get("type", "")
+                                if part_type == "tool":
+                                    tool_name = part.get("tool", "unknown")
+                                    call_id = part.get("callID", "unknown")
+                                    state = part.get("state", {})
+                                    if not isinstance(state, dict):
+                                        continue
                                     
-                                    await update_status(status_text)
+                                    status = state.get("status", "")
+                                    input_data = state.get("input", {})
+                                    output_data = state.get("output", "")
+                                    metadata = state.get("metadata", {})
+                                    if not isinstance(metadata, dict):
+                                        metadata = {}
 
-                                # ── 2. Stream Full Tool Logs (Only if is_streaming is True) ──
-                                if is_streaming:
-                                    # 1. Tool Call Started / Running
-                                    if status in ("pending", "running") and call_id not in notified_calls:
-                                        notified_calls.add(call_id)
-                                        
-                                        desc = input_data.get("description", "") if isinstance(input_data, dict) else ""
-                                        desc_text = f" — <i>\"{html.escape(desc)}\"</i>" if desc else ""
-                                        
-                                        # Format arguments
-                                        arg_lines = []
-                                        if isinstance(input_data, dict):
-                                            for k, v in input_data.items():
-                                                if k not in ("description", "content"):
-                                                    arg_lines.append(f"<b>{html.escape(str(k))}:</b> {html.escape(truncate(str(v)))}")
-                                        args_text = "\n".join(arg_lines)
-                                        
-                                        msg = (
-                                            f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>{desc_text}\n"
-                                        )
-                                        if args_text:
-                                            msg += f"{args_text}\n"
-                                            
-                                        await update.message.reply_text(msg, parse_mode="HTML")
-
-                                    # 2. Tool Completed
-                                    elif status == "completed" and call_id not in completed_calls:
-                                        completed_calls.add(call_id)
-                                        
-                                        exit_code = metadata.get("exit", 0)
-                                        output_cleaned = truncate(str(output_data))
-                                        
-                                        msg = (
-                                            f"✅ <b>Tool <code>{html.escape(tool_name)}</code> Completed</b> (Exit <code>{exit_code}</code>)\n"
-                                        )
-                                        if output_cleaned.strip():
-                                            msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+                                    # ── 1. Update In-Place Status Message (Always Active) ──
+                                    if status in ("pending", "running") and status_msg_holder and status_msg_holder[0]:
+                                        status_text = ""
+                                        if tool_name == "bash":
+                                            cmd = input_data.get("command") or input_data.get("content") or ""
+                                            cmd_truncated = truncate(cmd, 60)
+                                            status_text = f"💻 <b>Running shell command...</b>\n<code>{html.escape(cmd_truncated)}</code>"
+                                        elif tool_name in ("edit", "write", "save"):
+                                            path = input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
+                                            path_truncated = truncate(os.path.basename(path) if path else "", 60)
+                                            status_text = f"📝 <b>Modifying file...</b>\n<code>{html.escape(path_truncated)}</code>"
+                                        elif tool_name in ("read", "view", "show"):
+                                            path = input_data.get("path") or input_data.get("target") or input_data.get("filepath") or ""
+                                            path_truncated = truncate(os.path.basename(path) if path else "", 60)
+                                            status_text = f"🔍 <b>Reading file...</b>\n<code>{html.escape(path_truncated)}</code>"
+                                        elif tool_name in ("webfetch", "websearch", "search"):
+                                            query = input_data.get("query") or input_data.get("url") or ""
+                                            query_truncated = truncate(query, 60)
+                                            status_text = f"🌐 <b>Searching web...</b>\n<code>{html.escape(query_truncated)}</code>"
                                         else:
-                                            msg += f"<i>(No output returned)</i>"
-                                            
-                                        await update.message.reply_text(msg, parse_mode="HTML")
-
-                                    # 3. Tool Failed
-                                    elif status in ("failed", "error") and call_id not in completed_calls:
-                                        completed_calls.add(call_id)
+                                            status_text = f"⚙️ <b>Executing tool <code>{html.escape(tool_name)}</code>...</b>"
                                         
-                                        output_cleaned = truncate(str(output_data))
-                                        
-                                        msg = (
-                                            f"❌ <b>Tool <code>{html.escape(tool_name)}</code> Failed</b>\n"
-                                        )
-                                        if output_cleaned.strip():
-                                            msg += f"<pre>{html.escape(output_cleaned)}</pre>"
-                                        else:
-                                            msg += f"<i>(No error description returned)</i>"
-                                            
-                                        await update.message.reply_text(msg, parse_mode="HTML")
+                                        await update_status(status_text)
 
-                    except Exception as e:
-                        logger.debug(f"Error parsing SSE event in listener: {e}")
+                                    # ── 2. Stream Full Tool Logs (Only if is_streaming is True) ──
+                                    if is_streaming:
+                                        # 1. Tool Call Started / Running
+                                        if status in ("pending", "running") and call_id not in notified_calls:
+                                            notified_calls.add(call_id)
+                                            
+                                            desc = input_data.get("description", "") if isinstance(input_data, dict) else ""
+                                            desc_text = f" — <i>\"{html.escape(desc)}\"</i>" if desc else ""
+                                            
+                                            # Format arguments
+                                            arg_lines = []
+                                            if isinstance(input_data, dict):
+                                                for k, v in input_data.items():
+                                                    if k not in ("description", "content"):
+                                                        arg_lines.append(f"<b>{html.escape(str(k))}:</b> {html.escape(truncate(str(v)))}")
+                                            args_text = "\n".join(arg_lines)
+                                            
+                                            msg = (
+                                                f"🛠️ <b>Calling Tool <code>{html.escape(tool_name)}</code></b>{desc_text}\n"
+                                            )
+                                            if args_text:
+                                                msg += f"{args_text}\n"
+                                                
+                                            await update.message.reply_text(msg, parse_mode="HTML")
+
+                                        # 2. Tool Completed
+                                        elif status == "completed" and call_id not in completed_calls:
+                                            completed_calls.add(call_id)
+                                            
+                                            exit_code = metadata.get("exit", 0)
+                                            output_cleaned = truncate(str(output_data))
+                                            
+                                            msg = (
+                                                f"✅ <b>Tool <code>{html.escape(tool_name)}</code> Completed</b> (Exit <code>{exit_code}</code>)\n"
+                                            )
+                                            if output_cleaned.strip():
+                                                msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+                                            else:
+                                                msg += f"<i>(No output returned)</i>"
+                                                
+                                            await update.message.reply_text(msg, parse_mode="HTML")
+
+                                        # 3. Tool Failed
+                                        elif status in ("failed", "error") and call_id not in completed_calls:
+                                            completed_calls.add(call_id)
+                                            
+                                            output_cleaned = truncate(str(output_data))
+                                            
+                                            msg = (
+                                                f"❌ <b>Tool <code>{html.escape(tool_name)}</code> Failed</b>\n"
+                                            )
+                                            if output_cleaned.strip():
+                                                msg += f"<pre>{html.escape(output_cleaned)}</pre>"
+                                            else:
+                                                msg += f"<i>(No error description returned)</i>"
+                                                
+                                            await update.message.reply_text(msg, parse_mode="HTML")
+
+                        except Exception as e:
+                            logger.debug(f"Error parsing SSE event in listener: {e}")
 
         except asyncio.CancelledError:
-            pass
+            logger.debug("SSE streaming task listener cancelled by parent task.")
+            break
         except Exception as e:
-            logger.warning(f"Error in SSE streaming task listener: {e}")
+            err_name = e or type(e).__name__
+            logger.warning(f"Error in SSE streaming task listener: {err_name}. Reconnecting in {retry_delay}s...")
+            try:
+                await asyncio.sleep(retry_delay)
+            except asyncio.CancelledError:
+                break
+            retry_delay = min(retry_delay * 2, 10.0)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

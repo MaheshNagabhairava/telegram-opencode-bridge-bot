@@ -69,7 +69,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/build — Switch to build mode (read, write, execute)\n"
         "/share — Share current session (get public URL)\n"
         "/status — Show bot & connection status\n"
-        "/id — Show your Telegram user ID\n\n"
+        "/id — Show your Telegram user ID\n"
+        "/update — Check and install updates\n\n"
         "<b>💡 Tips:</b>\n"
         "• Just type normally to chat with OpenCode\n"
         "• Use <code>@filename</code> in prompts to reference files\n"
@@ -1159,6 +1160,127 @@ async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ──────────────────────────────────────────────
+# Command: /update
+# ──────────────────────────────────────────────
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check for and apply bot updates, then restart the process in-place."""
+    import asyncio
+    import os
+    import sys
+    import html
+    from utils.formatting import format_error
+
+    user_id = update.effective_user.id
+    
+    # 1. Send initial status message
+    status_msg = await update.message.reply_text(
+        "⏳ <b>Checking for bot updates...</b>",
+        parse_mode="HTML"
+    )
+
+    async def update_status(text: str):
+        try:
+            await status_msg.edit_text(text, parse_mode="HTML")
+        except Exception:
+            await update.message.reply_text(text, parse_mode="HTML")
+
+    is_git = os.path.exists(".git")
+    
+    def run_cmd_sync(command: str) -> tuple[int, str, str]:
+        """Helper to run a shell command synchronously."""
+        import subprocess
+        proc = subprocess.run(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
+
+    async def run_cmd(command: str) -> tuple[int, str, str]:
+        """Helper to run a shell command in a background thread."""
+        return await asyncio.to_thread(run_cmd_sync, command)
+
+    if is_git:
+        await update_status("🔍 <b>Detected Git installation. Fetching remote changes...</b>")
+        
+        # 1. Git fetch
+        code, stdout, stderr = await run_cmd("git fetch origin")
+        if code != 0:
+            await update_status(
+                f"❌ <b>Git fetch failed:</b>\n"
+                f"<pre>{html.escape(stderr or stdout)}</pre>"
+            )
+            return
+
+        # 2. Check diff
+        code_local, local_hash, _ = await run_cmd("git rev-parse HEAD")
+        code_remote, remote_hash, _ = await run_cmd("git rev-parse @{u}")
+        
+        if code_local != 0 or code_remote != 0:
+            await update_status("❌ <b>Failed to resolve Git commit hashes.</b>")
+            return
+
+        if local_hash == remote_hash:
+            await update_status(
+                f"✨ <b>Your bot is already up to date!</b>\n"
+                f"Commit: <code>{local_hash[:8]}</code>"
+            )
+            return
+
+        await update_status("🔄 <b>New updates found. Pulling latest code changes...</b>")
+        
+        # 3. Git pull
+        code_pull, pull_stdout, pull_stderr = await run_cmd("git pull")
+        if code_pull != 0:
+            await update_status(
+                f"❌ <b>Git pull failed:</b>\n"
+                f"<pre>{html.escape(pull_stderr or pull_stdout)}</pre>"
+            )
+            return
+
+        # 4. Pip install requirements if updated
+        if os.path.exists("requirements.txt"):
+            await update_status("📦 <b>Updating dependencies from requirements.txt...</b>")
+            await run_cmd(f"{sys.executable} -m pip install -r requirements.txt")
+
+    else:
+        # Pip package installation
+        await update_status("🔍 <b>Detected Pip installation. Checking PyPI for updates...</b>")
+        
+        # Run pip install --upgrade
+        code, stdout, stderr = await run_cmd(f"{sys.executable} -m pip install --upgrade telegram-opencode-bridge-bot")
+        if code != 0:
+            await update_status(
+                f"❌ <b>Pip upgrade failed:</b>\n"
+                f"<pre>{html.escape(stderr or stdout)}</pre>"
+            )
+            return
+
+        # Check if it was already up to date
+        if "Requirement already satisfied" in stdout and "Successfully installed" not in stdout:
+            await update_status("✨ <b>Your bot is already up to date!</b>")
+            return
+
+    # Trigger restart
+    await update_status("✅ <b>Update complete! Restarting bot in-place...</b>")
+    
+    # Wait 1 second to let Telegram send the message completely
+    await asyncio.sleep(1)
+    
+    # Close any running connections or servers nicely
+    try:
+        from opencode.server import stop_server
+        await stop_server()
+    except Exception:
+        pass
+
+    # Exec process replacement
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# ──────────────────────────────────────────────
 # Register bot commands for Telegram menu
 # ──────────────────────────────────────────────
 async def set_bot_commands(app) -> None:
@@ -1183,6 +1305,7 @@ async def set_bot_commands(app) -> None:
         BotCommand("share", "Share current session"),
         BotCommand("status", "Bot & connection status"),
         BotCommand("id", "Show your Telegram user ID"),
+        BotCommand("update", "Check and install updates"),
     ]
     await app.bot.set_my_commands(commands)
     

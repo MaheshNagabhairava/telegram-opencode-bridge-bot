@@ -41,45 +41,65 @@ async def restart_server(directory: str, port: int = 8080, hostname: str = "127.
     await stop_server()
     await asyncio.sleep(1)
 
-    # 2. Start a new one from the target directory
     binary = get_opencode_binary()
     cmd = [binary, "serve", "--port", str(port), "--hostname", hostname]
 
-    logger.info(f"Starting opencode serve from {directory}: {' '.join(cmd)}")
+    creationflags = 0
+    if platform.system() == "Windows":
+        creationflags = 0x00000200  # CREATE_NEW_PROCESS_GROUP
 
-    try:
-        creationflags = 0
-        if platform.system() == "Windows":
-            # CREATE_NEW_PROCESS_GROUP = 0x00000200
-            creationflags = 0x00000200
-
-        _server_process = subprocess.Popen(
-            cmd,
-            cwd=directory,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            stdin=subprocess.DEVNULL,
-            creationflags=creationflags,
-            start_new_session=(platform.system() != "Windows"),
-        )
-    except Exception as e:
-        logger.error(f"Failed to start opencode serve: {e}")
-        return False
-
-    # 3. Wait until the server is reachable (max 30s)
-    import aiohttp
-    for attempt in range(30):
-        await asyncio.sleep(1)
+    for run_attempt in range(1, 3):
+        logger.info(f"Starting opencode serve (attempt {run_attempt}/2) from {directory}: {' '.join(cmd)}")
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"http://{hostname}:{port}/session", timeout=aiohttp.ClientTimeout(total=2)) as resp:
-                    if resp.status < 500:
-                        logger.info(f"opencode serve is up after {attempt + 1}s (pid={_server_process.pid})")
-                        return True
-        except Exception:
-            pass
+            _server_process = subprocess.Popen(
+                cmd,
+                cwd=directory,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                creationflags=creationflags,
+                start_new_session=(platform.system() != "Windows"),
+            )
+        except Exception as e:
+            logger.error(f"Failed to start opencode serve on attempt {run_attempt}: {e}")
+            if run_attempt == 2:
+                return False
+            await asyncio.sleep(2)
+            continue
 
-    logger.error("opencode serve did not become reachable within 30s")
+        # 3. Wait until the server is reachable (max 15 attempts, 1s sleep + 1s timeout)
+        import aiohttp
+        for attempt in range(15):
+            # Check if the process exited prematurely
+            poll_code = _server_process.poll()
+            if poll_code is not None:
+                logger.warning(f"opencode serve process exited prematurely with code {poll_code} on attempt {run_attempt}")
+                break
+
+            await asyncio.sleep(1)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(f"http://{hostname}:{port}/session", timeout=aiohttp.ClientTimeout(total=1)) as resp:
+                        if resp.status < 500:
+                            logger.info(f"opencode serve is up after {attempt + 1}s (pid={_server_process.pid})")
+                            return True
+            except Exception:
+                pass
+
+        # Cleanup failed process
+        if _server_process:
+            try:
+                _server_process.terminate()
+                _server_process.wait(timeout=2)
+            except Exception:
+                pass
+            _server_process = None
+
+        if run_attempt == 1:
+            logger.warning("First startup attempt failed or port was busy. Retrying in 2 seconds...")
+            await asyncio.sleep(2)
+
+    logger.error("opencode serve did not become reachable after 2 attempts")
     return False
 
 

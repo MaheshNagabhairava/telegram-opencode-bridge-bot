@@ -41,7 +41,7 @@ A premium, feature-rich Python bot that bridges your Telegram client directly to
 ### Option A: Standard PyPI Installation
 Install and run the bot wrapper directly from the terminal:
 ```bash
-pip install telegram-opencode-bridge-bot==0.1.8
+pip install telegram-opencode-bridge-bot==0.1.9
 telegram-opencode-bot
 ```
 > **💡 Tip:** Use the `--env` flag anytime to reconfigure your variables:
@@ -89,7 +89,7 @@ telegram-opencode-bot
 | **`/enable`** | — | Enables real-time streaming of tool calls, shell executions, and file edits. |
 | **`/disable`** | — | Disables streaming; the bot will only report the final LLM response. |
 | **`/share`** | — | Fetches a public, shareable web preview URL of the active conversation. |
-
+| **`/update`** | — | Update to a new available version. |
 ---
 
 ## ⚙️ Configuration Variables
