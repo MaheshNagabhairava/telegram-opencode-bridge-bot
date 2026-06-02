@@ -1186,6 +1186,37 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     is_git = os.path.exists(".git")
     
+    def get_installed_version() -> str:
+        import importlib.metadata
+        try:
+            return importlib.metadata.version('telegram-opencode-bridge-bot')
+        except Exception:
+            try:
+                if os.path.exists("pyproject.toml"):
+                    with open("pyproject.toml", "r", encoding="utf-8") as f:
+                        for line in f:
+                            if line.strip().startswith("version ="):
+                                return line.split("=")[1].strip().strip('"\'')
+            except Exception:
+                pass
+        return "0.0.0"
+
+    async def get_latest_pypi_version() -> str:
+        import urllib.request
+        import json
+        
+        def fetch():
+            try:
+                url = "https://pypi.org/pypi/telegram-opencode-bridge-bot/json"
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with urllib.request.urlopen(req, timeout=5) as response:
+                    data = json.loads(response.read().decode())
+                    return data['info']['version']
+            except Exception:
+                return ""
+                
+        return await asyncio.to_thread(fetch)
+
     def run_cmd_sync(command: list[str]) -> tuple[int, str, str]:
         """Helper to run a command synchronously."""
         import subprocess
@@ -1249,19 +1280,71 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # Pip package installation
         await update_status("🔍 <b>Detected Pip installation. Checking PyPI for updates...</b>")
         
-        # Run pip install --upgrade
-        code, stdout, stderr = await run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "telegram-opencode-bridge-bot"])
-        if code != 0:
+        installed_version = get_installed_version()
+        latest_version = await get_latest_pypi_version()
+        
+        if not latest_version:
+            await update_status("❌ <b>Could not reach PyPI to check for updates.</b>")
+            return
+            
+        if installed_version == latest_version:
             await update_status(
-                f"❌ <b>Pip upgrade failed:</b>\n"
-                f"<pre>{html.escape(stderr or stdout)}</pre>"
+                f"✨ <b>Your bot is already up to date!</b>\n"
+                f"Installed version: <code>{installed_version}</code>"
             )
             return
-
-        # Check if it was already up to date
-        if "Requirement already satisfied" in stdout and "Successfully installed" not in stdout:
-            await update_status("✨ <b>Your bot is already up to date!</b>")
-            return
+            
+        if sys.platform == 'win32':
+            # On Windows, upgrading a running package can throw WinError 32 if telegram-opencode-bot.exe is locked.
+            # Spawn a detached updater process, exit immediately to free locks, and let the updater upgrade & restart the bot.
+            await update_status(
+                f"🔄 <b>New version found: <code>{installed_version}</code> → <code>{latest_version}</code></b>\n"
+                f"Spawning background updater to release binary locks..."
+            )
+            await asyncio.sleep(1)
+            
+            try:
+                from opencode.server import stop_server
+                await stop_server()
+            except Exception:
+                pass
+                
+            import subprocess
+            creationflags = 0x00000008  # DETACHED_PROCESS
+            
+            updater_code = (
+                "import time, subprocess, sys, os\n"
+                "pid = int(sys.argv[1])\n"
+                "while True:\n"
+                "    try:\n"
+                "        os.kill(pid, 0)\n"
+                "    except OSError:\n"
+                "        break\n"
+                "    time.sleep(0.5)\n"
+                "subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', 'telegram-opencode-bridge-bot'])\n"
+                "subprocess.Popen(sys.argv[2:])\n"
+            )
+            
+            subprocess.Popen(
+                [sys.executable, "-c", updater_code, str(os.getpid())] + [sys.executable] + sys.argv,
+                creationflags=creationflags,
+                close_fds=True
+            )
+            os._exit(0)
+            
+        else:
+            # On Linux/macOS, files are not exclusively locked during execution, so in-place upgrade works safely.
+            await update_status(
+                f"🔄 <b>New version found: <code>{installed_version}</code> → <code>{latest_version}</code></b>\n"
+                f"Upgrading package..."
+            )
+            code, stdout, stderr = await run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "telegram-opencode-bridge-bot"])
+            if code != 0:
+                await update_status(
+                    f"❌ <b>Pip upgrade failed:</b>\n"
+                    f"<pre>{html.escape(stderr or stdout)}</pre>"
+                )
+                return
 
     # Trigger restart
     await update_status("✅ <b>Update complete! Restarting bot in-place...</b>")
