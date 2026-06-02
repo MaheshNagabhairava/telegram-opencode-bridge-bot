@@ -41,7 +41,7 @@ A premium, feature-rich Python bot that bridges your Telegram client directly to
 ### Option A: Standard PyPI Installation
 Install and run the bot wrapper directly from the terminal:
 ```bash
-pip install telegram-opencode-bridge-bot==0.1.10
+pip install telegram-opencode-bridge-bot==0.1.11
 telegram-opencode-bot
 ```
 > **💡 Tip:** Use the `--env` flag anytime to reconfigure your variables:
@@ -126,7 +126,7 @@ The following parameters can be defined in your `.env` configuration file:
           ┌────────┴────────┐
           ▼                 ▼
    🤖 LLM Provider    📁 Local Workspace
-(Claude/DeepSeek/etc.)  (Shell / Filesystem)
+(Claude/DeepSeek/Codex/etc.)  (Shell / Filesystem)
 ```
 
 ---
