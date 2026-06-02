@@ -70,6 +70,11 @@ class SessionManager:
             await self._db.execute("ALTER TABLE user_settings ADD COLUMN model TEXT DEFAULT ''")
         except aiosqlite.OperationalError:
             pass
+
+        try:
+            await self._db.execute("ALTER TABLE user_settings ADD COLUMN mode TEXT DEFAULT ''")
+        except aiosqlite.OperationalError:
+            pass
             
         await self._db.execute("""  
             CREATE INDEX IF NOT EXISTS idx_user_active 
@@ -106,7 +111,7 @@ class SessionManager:
         return self._active_sessions.get(user_id)
     
     async def set_active_session(
-        self, user_id: int, opencode_session_id: str, model: str = "", work_dir: str = ""
+        self, user_id: int, opencode_session_id: str, model: str = "", work_dir: str = "", mode: str = "build"
     ) -> None:
         """Set or create an active session for a user."""
         now = datetime.utcnow().isoformat()
@@ -120,8 +125,8 @@ class SessionManager:
         
         # Insert new active session
         await self._db.execute(
-            "INSERT INTO sessions (user_id, opencode_session_id, model, created_at, last_active, name, work_dir) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (user_id, opencode_session_id, model, now, now, "", work_dir)
+            "INSERT INTO sessions (user_id, opencode_session_id, model, mode, created_at, last_active, name, work_dir) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, opencode_session_id, model, mode, now, now, "", work_dir)
         )
         await self._db.commit()
         
@@ -129,7 +134,7 @@ class SessionManager:
         self._active_sessions[user_id] = {
             "session_id": opencode_session_id,
             "model": model,
-            "mode": "build",
+            "mode": mode,
             "message_count": 0,
             "created_at": now,
             "last_active": now,
@@ -169,7 +174,11 @@ class SessionManager:
             await self._db.commit()
     
     async def set_mode(self, user_id: int, mode: str) -> None:
-        """Set the mode (build/plan) for a user's active session."""
+        """Set the mode (build/plan/pentester) for a user's active session and also save as preferred settings."""
+        # 1. Save in user_settings
+        await self.set_user_preferred_mode(user_id, mode)
+        
+        # 2. Update active session if exists
         if user_id in self._active_sessions:
             self._active_sessions[user_id]["mode"] = mode
             await self._db.execute(
@@ -212,6 +221,27 @@ class SessionManager:
         )
         await self._db.commit()
         logger.info(f"Set preferred model for user {user_id}: {model}")
+
+    async def get_user_preferred_mode(self, user_id: int, default_mode: str = "build") -> str:
+        """Get the preferred mode (build/plan/pentester) for a specific user, falling back to default."""
+        async with self._db.execute(
+            "SELECT mode FROM user_settings WHERE user_id = ?",
+            (user_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+        return default_mode
+
+    async def set_user_preferred_mode(self, user_id: int, mode: str) -> None:
+        """Save or update the preferred mode for a user in their settings."""
+        await self._db.execute(
+            "INSERT INTO user_settings (user_id, work_dir, mode) VALUES (?, '', ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET mode = excluded.mode",
+            (user_id, mode)
+        )
+        await self._db.commit()
+        logger.info(f"Set preferred mode for user {user_id}: {mode}")
     
     async def clear_session(self, user_id: int) -> None:
         """Deactivate the current session for a user (they'll get a new one on next message)."""
@@ -364,6 +394,16 @@ class SessionManager:
             if row:
                 return row[0]
         return None
+
+    def is_session_running(self, user_id: int) -> bool:
+        """Check if the user's active session is currently processing a prompt."""
+        session = self._active_sessions.get(user_id)
+        return session.get("running", False) if session else False
+
+    def set_session_running(self, user_id: int, running: bool) -> None:
+        """Set the processing/running flag for the user's active session."""
+        if user_id in self._active_sessions:
+            self._active_sessions[user_id]["running"] = running
     
     async def close(self) -> None:
         """Close the database connection."""

@@ -167,6 +167,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     before_ids = set()
     sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
     sent_message_ids.clear()
+    session_mgr.set_session_running(user_id, True)
     try:
         # Fetch message IDs before sending the prompt
         try:
@@ -177,6 +178,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         session_info = await session_mgr.get_session_info(user_id)
         session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+        session_mode = (session_info or {}).get("mode", "build") or "build"
 
         try:
             response_text = await _send_to_opencode(
@@ -184,20 +186,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 session_id=session_id,
                 prompt=message_text,
                 model=session_model,
+                agent=session_mode,
             )
 
             if response_text is None:
                 # Session expired or was deleted/lost on the OpenCode server (e.g. server restart)
                 logger.warning(f"Session {session_id[:8]}... not found on server (returned null). Creating a new session and retrying...")
                 session_id = await _create_session(oc_client, user_id, session_mgr, config)
-                # Re-fetch model for safe retry
+                # Re-fetch model and mode for safe retry
                 session_info = await session_mgr.get_session_info(user_id)
                 session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+                session_mode = (session_info or {}).get("mode", "build") or "build"
                 response_text = await _send_to_opencode(
                     oc_client=oc_client,
                     session_id=session_id,
                     prompt=message_text,
                     model=session_model,
+                    agent=session_mode,
                 )
         except OpenCodeConnectionError as conn_err:
             # Connection crashed/failed - Reset flag and self-heal!
@@ -214,12 +219,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 session_id = await _create_session(oc_client, user_id, session_mgr, config)
                 session_info = await session_mgr.get_session_info(user_id)
                 session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+                session_mode = (session_info or {}).get("mode", "build") or "build"
                 
                 response_text = await _send_to_opencode(
                     oc_client=oc_client,
                     session_id=session_id,
                     prompt=message_text,
                     model=session_model,
+                    agent=session_mode,
                 )
             else:
                 raise conn_err
@@ -245,6 +252,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 session_id = await _create_session(oc_client, user_id, session_mgr, config)
                 session_info = await session_mgr.get_session_info(user_id)
                 session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+                session_mode = (session_info or {}).get("mode", "build") or "build"
                 
                 await update.message.reply_text(
                     "⚠️ <i>Active session was deleted or expired on the server. Starting a fresh session...</i>",
@@ -257,6 +265,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     session_id=session_id,
                     prompt=message_text,
                     model=session_model,
+                    agent=session_mode,
                 )
             else:
                 raise
@@ -283,6 +292,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     finally:
+        session_mgr.set_session_running(user_id, False)
         if typing_task:
             typing_task.cancel()
         if sse_task:
@@ -389,21 +399,24 @@ async def _create_session(oc_client, user_id, session_mgr, config):
     if not session_id:
         raise ValueError(f"OpenCode server response did not contain a session ID: {result}")
 
-    # Fetch user preferred model, falling back to config model
+    # Fetch user preferred model and mode, falling back to defaults
     preferred_model = await session_mgr.get_user_preferred_model(user_id, config.opencode_model)
+    preferred_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
 
-    await session_mgr.set_active_session(user_id, session_id, preferred_model, work_dir=work_dir)
+    await session_mgr.set_active_session(
+        user_id, session_id, preferred_model, work_dir=work_dir, mode=preferred_mode
+    )
     return session_id
 
 
-async def _send_to_opencode(oc_client, session_id, prompt, model):
+async def _send_to_opencode(oc_client, session_id, prompt, model, agent):
     """Send a prompt to OpenCode HTTP API.
 
     Returns:
         The response text from OpenCode, or None if the session does not exist.
     """
-    logger.info(f"Sending to OpenCode API: session={session_id[:8]}... model={model}")
-    response = await oc_client.send_message(session_id, prompt, model=model)
+    logger.info(f"Sending to OpenCode API: session={session_id[:8]}... model={model} agent={agent}")
+    response = await oc_client.send_message(session_id, prompt, model=model, agent=agent)
     if response is None:
         return None
     return response.content
@@ -878,9 +891,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         before_ids = set()
         sent_message_ids = context.user_data.setdefault("sent_message_ids", set())
         sent_message_ids.clear()
+        session_mgr.set_session_running(user_id, True)
         try:
             session_info = await session_mgr.get_session_info(user_id)
             session_model = (session_info or {}).get("model", config.opencode_model) or config.opencode_model
+            session_mode = (session_info or {}).get("mode", "build") or "build"
 
             # Fetch message IDs before sending the prompt
             try:
@@ -894,6 +909,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 session_id=session_id,
                 prompt=prompt_text,
                 model=session_model,
+                agent=session_mode,
             )
 
             # Increment count
@@ -972,6 +988,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 parse_mode="HTML"
             )
         finally:
+            session_mgr.set_session_running(user_id, False)
             if typing_task:
                 typing_task.cancel()
             if sse_task:

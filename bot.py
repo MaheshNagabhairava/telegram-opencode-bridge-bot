@@ -48,6 +48,7 @@ from handlers.commands import (
     delete_command,
     plan_command,
     build_command,
+    mode_command,
     share_command,
     status_command,
     id_command,
@@ -58,6 +59,7 @@ from handlers.commands import (
     delete_project_command,
     enable_command,
     disable_command,
+    history_command,
     set_bot_commands,
     callback_handler,
 )
@@ -162,6 +164,10 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         await build_command(update, context)
 
     @authorized(authorizer, rate_limiter)
+    async def _mode(update, context):
+        await mode_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
     async def _share(update, context):
         await share_command(update, context)
 
@@ -201,6 +207,10 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
     async def _disable(update, context):
         await disable_command(update, context)
 
+    @authorized(authorizer, rate_limiter)
+    async def _history(update, context):
+        await history_command(update, context)
+
     @authorized(authorizer)
     async def _callback(update, context):
         await callback_handler(update, context)
@@ -226,8 +236,10 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "delete_project": _delete_project,
         "enable": _enable,
         "disable": _disable,
+        "history": _history,
         "plan": _plan,
         "build": _build,
+        "mode": _mode,
         "share": _share,
         "status": _status,
         "id": _id,
@@ -537,6 +549,8 @@ def main():
     application.add_handler(CommandHandler("delete_project", handlers["delete_project"], block=False))
     application.add_handler(CommandHandler("enable", handlers["enable"], block=False))
     application.add_handler(CommandHandler("disable", handlers["disable"], block=False))
+    application.add_handler(CommandHandler("history", handlers["history"], block=False))
+    application.add_handler(CommandHandler("mode", handlers["mode"], block=False))
     application.add_handler(CommandHandler("plan", handlers["plan"], block=False))
     application.add_handler(CommandHandler("build", handlers["build"], block=False))
     application.add_handler(CommandHandler("share", handlers["share"], block=False))

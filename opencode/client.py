@@ -311,6 +311,7 @@ class OpenCodeClient:
         session_id: str,
         content: str,
         model: Optional[str] = None,
+        agent: Optional[str] = None,
     ) -> Optional[OpenCodeMessage]:
         """Send a prompt to an OpenCode session and return the response.
 
@@ -318,6 +319,7 @@ class OpenCodeClient:
             session_id: The target session identifier.
             content: The user-facing prompt text.
             model: Optional model identifier (e.g. "provider/model").
+            agent: Optional agent identifier (e.g. "build", "plan", "pentester").
 
         Returns:
             An :class:`OpenCodeMessage` containing the assistant's reply.
@@ -330,6 +332,9 @@ class OpenCodeClient:
                 }
             ]
         }
+
+        if agent:
+            payload["agent"] = agent.strip()
 
         if model:
             if "/" in model:
@@ -440,6 +445,28 @@ class OpenCodeClient:
                 return json.loads(text)
             except ValueError:
                 return {}
+
+    async def get_available_agents(self) -> List[Dict[str, Any]]:
+        """Fetch all available agents from the server."""
+        session = await self._get_session()
+        url = f"{self.server_url}/agent"
+        headers = {"Accept": "application/json"}
+        
+        async with session.get(url, headers=headers) as resp:
+            if resp.status >= 400:
+                body = await resp.text()
+                raise OpenCodeAPIError(resp.status, body)
+            
+            content_type = resp.headers.get("Content-Type", "")
+            if "json" in content_type:
+                return await resp.json()
+            
+            text = await resp.text()
+            try:
+                import json
+                return json.loads(text)
+            except ValueError:
+                return []
 
     async def abort_session(self, session_id: str) -> bool:
         """Send an abort signal to stop active model processing in a session."""

@@ -61,8 +61,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/enable — Enable live tool call & progress streaming\n"
         "/disable — Disable live progress streaming\n"
         "/sessions — List your recent sessions (tap to switch)\n"
+        "/history [count] — Show active session history\n"
         "/delete — Permanently delete a session\n"
         "/models — List all available models (tap to change)\n"
+        "/mode — Select agent mode (TUI dropdown equivalents)\n"
         "/plan — Switch to plan mode (read-only)\n"
         "/build — Switch to build mode (read, write, execute)\n"
         "/share — Share current session (get public URL)\n"
@@ -477,6 +479,71 @@ async def build_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+async def mode_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List all available agent modes on the OpenCode server."""
+    user_id = update.effective_user.id
+    bot_data = context.bot_data
+    oc_client = bot_data["opencode_client"]
+    session_mgr = bot_data["session_manager"]
+
+    # Ensure OpenCode server is running dynamically
+    from handlers.messages import ensure_server_running
+    if not await ensure_server_running(update, context, user_id):
+        return
+
+    await update.message.chat.send_action(ChatAction.TYPING)
+
+    try:
+        agents = await oc_client.get_available_agents()
+        if not agents:
+            await update.message.reply_text("📭 No agent modes found on the server.", parse_mode="HTML")
+            return
+
+        session_info = await session_mgr.get_session_info(user_id)
+        current_mode = (session_info or {}).get("mode", "build") or "build"
+
+        # Emojis mapping for premium design
+        mode_emojis = {
+            "build": "🔨",
+            "plan": "📋",
+            "pentester": "🕵️",
+        }
+
+        keyboard = []
+        for agent in agents:
+            if agent.get("hidden"):
+                continue
+            name = agent.get("name", "")
+            if not name:
+                continue
+
+            emoji = mode_emojis.get(name.lower(), "🤖")
+            is_active = (name.lower() == current_mode.lower())
+            
+            # Label
+            label = f"{emoji} {name.upper()}"
+            if is_active:
+                label += " 🔹 (Current)"
+            
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"mode:{name}")])
+
+        reply_markup = InlineKeyboardMarkup(keyboard) if keyboard else None
+        
+        await update.message.reply_text(
+            "<b>🤖 Select Agent Mode</b>\n\n"
+            "Choose which AI agent configuration and permissions to use for this session:",
+            reply_markup=reply_markup,
+            parse_mode="HTML",
+        )
+
+    except Exception as e:
+        logger.error(f"Failed to fetch agents: {e}", exc_info=True)
+        await update.message.reply_text(
+            f"❌ Failed to retrieve agents from OpenCode server: {html.escape(str(e))}",
+            parse_mode="HTML",
+        )
+
+
 # ──────────────────────────────────────────────
 # Command: /share
 # ──────────────────────────────────────────────
@@ -828,9 +895,12 @@ async def execute_project_switch(update_or_query, context: ContextTypes.DEFAULT_
             if not session_id:
                 raise ValueError("Response did not contain a session ID.")
 
-            # Fetch user preferred model, falling back to config model
+            # Fetch user preferred model and mode
             preferred_model = await session_mgr.get_user_preferred_model(user_id, config.opencode_model)
-            await session_mgr.set_active_session(user_id, session_id, preferred_model, work_dir=target_path)
+            preferred_mode = await session_mgr.get_user_preferred_mode(user_id, "build")
+            await session_mgr.set_active_session(
+                user_id, session_id, preferred_model, work_dir=target_path, mode=preferred_mode
+            )
 
             await update_status(
                 f"🔄 <b>Switched project to:</b> <code>{html.escape(target_folder)}</code>\n"
@@ -944,6 +1014,151 @@ async def disable_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 
 # ──────────────────────────────────────────────
+# Command: /history [count]
+# ──────────────────────────────────────────────
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fetch and display conversation history of the currently active session."""
+    import asyncio
+    import html
+    from utils.formatting import format_opencode_response, split_message, format_error
+
+    user_id = update.effective_user.id
+    bot_data = context.bot_data
+    session_mgr = bot_data["session_manager"]
+    oc_client = bot_data["opencode_client"]
+    config = bot_data["config"]
+
+    # 1. Ensure OpenCode server is running dynamically
+    from handlers.messages import ensure_server_running
+    if not await ensure_server_running(update, context, user_id):
+        return
+
+    # 2. Get active session ID
+    session_id = await session_mgr.get_active_session(user_id)
+    if not session_id:
+        await update.message.reply_text(
+            "📭 <b>No active session found.</b>\n\n"
+            "Send a message first to start a conversation or use /sessions to switch/select a session.",
+            parse_mode="HTML"
+        )
+        return
+
+    # 3. Parse optional [count] argument
+    count = None
+    if context.args:
+        try:
+            count = int(context.args[0])
+            if count <= 0:
+                raise ValueError()
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ <b>Invalid argument!</b>\n\n"
+                "Please provide a positive integer, e.g., <code>/history 5</code>.",
+                parse_mode="HTML"
+            )
+            return
+
+    # 4. Fetch messages from server
+    try:
+        messages = await oc_client.list_messages(session_id)
+    except Exception as e:
+        logger.error(f"Failed to fetch conversation history for session {session_id[:8]}...: {e}", exc_info=True)
+        await update.message.reply_text(
+            format_error(f"Failed to fetch conversation history: {e}"),
+            parse_mode="HTML"
+        )
+        return
+
+    # 5. Helper function to extract text
+    def extract_conversational_text(message: dict) -> str:
+        parts = message.get("parts", [])
+        content_text = ""
+        if isinstance(parts, list):
+            # Join all text parts, ignoring reasoning, steps, tool calls etc.
+            text_parts = [
+                p.get("text", "")
+                for p in parts
+                if isinstance(p, dict) and p.get("type") == "text"
+            ]
+            content_text = "".join(text_parts)
+        
+        # Fallback to content or text fields if parts are missing or empty
+        if not content_text.strip():
+            content_text = message.get("content", message.get("text", ""))
+            
+        return content_text.strip()
+
+    # 6. Parse and format messages chronologically
+    formatted_messages = []
+    for msg in messages:
+        content_text = extract_conversational_text(msg)
+        if not content_text:
+            continue
+        
+        # Extract role
+        role = msg.get("info", {}).get("role") or msg.get("role", "")
+        formatted_messages.append((role, content_text))
+
+    # Slice the messages to count if specified
+    if count is not None:
+        formatted_messages = formatted_messages[-count:]
+
+    if not formatted_messages:
+        await update.message.reply_text(
+            "📭 <b>No conversational history found in this session yet.</b>",
+            parse_mode="HTML"
+        )
+        return
+
+    # Build history blocks
+    history_parts = []
+    for role, text in formatted_messages:
+        formatted_text = format_opencode_response(text)
+        if role == "user":
+            history_parts.append(f"👤 <b>User:</b>\n{formatted_text}")
+        else:
+            # assistant
+            history_parts.append(f"🤖 <b>OpenCode:</b>\n{formatted_text}")
+
+    history_text = "\n\n───────────────────\n\n".join(history_parts)
+
+    # 7. Check if the active session is running a task and add header
+    header = ""
+    if session_mgr.is_session_running(user_id):
+        header = (
+            "⚡ <b>(Active Running Task)</b>\n"
+            "<i>OpenCode is currently busy running a prompt. The history below may not reflect the latest pending response.</i>\n\n"
+            "───────────────────\n\n"
+        )
+
+    full_text = header + history_text
+
+    # 8. Split and send sequentially
+    chunks = split_message(full_text, 4000)
+    for i, chunk in enumerate(chunks):
+        try:
+            await update.message.reply_text(
+                chunk,
+                parse_mode="HTML",
+                disable_web_page_preview=True
+            )
+        except Exception as e:
+            logger.warning(f"HTML parsing failed for history chunk {i+1}, falling back to plain text: {e}")
+            try:
+                import re
+                plain = re.sub(r'<[^>]+>', '', chunk)
+                await update.message.reply_text(
+                    plain,
+                    disable_web_page_preview=True
+                )
+            except Exception as e2:
+                logger.error(f"Failed to send history chunk {i+1} as plain text: {e2}")
+
+        if i < len(chunks) - 1:
+            await asyncio.sleep(0.5)
+
+
+# ──────────────────────────────────────────────
 # Register bot commands for Telegram menu
 # ──────────────────────────────────────────────
 async def set_bot_commands(app) -> None:
@@ -959,8 +1174,10 @@ async def set_bot_commands(app) -> None:
         BotCommand("enable", "Enable live progress streaming"),
         BotCommand("disable", "Disable live progress streaming"),
         BotCommand("sessions", "List your sessions"),
+        BotCommand("history", "Show active session history"),
         BotCommand("delete", "Permanently delete a session"),
         BotCommand("models", "List all available models"),
+        BotCommand("mode", "Select agent mode (TUI dropdown equivalents)"),
         BotCommand("plan", "Switch to plan mode (read-only)"),
         BotCommand("build", "Switch to build mode (read, write, execute)"),
         BotCommand("share", "Share current session"),
@@ -1204,6 +1421,24 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         await query.edit_message_text(
             f"✅ Model changed to <code>{html.escape(new_model)}</code>\n\n"
             f"<i>This applies to your current session.</i>",
+            parse_mode="HTML",
+        )
+
+    # 2.3 Switch Mode/Agent tap
+    elif data.startswith("mode:"):
+        new_mode = data[len("mode:"):]
+        await session_mgr.set_mode(user_id, new_mode)
+        
+        mode_emojis = {
+            "build": "🔨",
+            "plan": "📋",
+            "pentester": "🕵️",
+        }
+        emoji = mode_emojis.get(new_mode.lower(), "🤖")
+        
+        await query.edit_message_text(
+            f"{emoji} Mode changed to <b>{html.escape(new_mode)}</b>\n\n"
+            f"<i>OpenCode will now use the '{html.escape(new_mode)}' agent configuration.</i>",
             parse_mode="HTML",
         )
 
