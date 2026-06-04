@@ -62,6 +62,8 @@ from handlers.commands import (
     history_command,
     set_bot_commands,
     callback_handler,
+    mcps_command,
+    skills_command,
 )
 from handlers.messages import handle_message, handle_document
 
@@ -223,6 +225,14 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
     async def _document(update, context):
         await handle_document(update, context)
 
+    @authorized(authorizer, rate_limiter)
+    async def _mcps(update, context):
+        await mcps_command(update, context)
+
+    @authorized(authorizer, rate_limiter)
+    async def _skills(update, context):
+        await skills_command(update, context)
+
     return {
         "start": _start,
         "help": _help,
@@ -246,6 +256,8 @@ def build_authorized_handlers(authorizer: UserAuthorizer, rate_limiter: RateLimi
         "callback": _callback,
         "message": _message,
         "document": _document,
+        "mcps": _mcps,
+        "skills": _skills,
     }
 
 
@@ -556,6 +568,8 @@ def main():
     application.add_handler(CommandHandler("share", handlers["share"], block=False))
     application.add_handler(CommandHandler("status", handlers["status"], block=False))
     application.add_handler(CommandHandler("id", handlers["id"], block=False))
+    application.add_handler(CommandHandler("mcps", handlers["mcps"], block=False))
+    application.add_handler(CommandHandler("skills", handlers["skills"], block=False))
 
     # ── Register callback query handler ───────────────────
     application.add_handler(CallbackQueryHandler(handlers["callback"], block=False))

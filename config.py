@@ -75,6 +75,9 @@ class Config:
         default_factory=lambda: os.getenv('DB_PATH', 'sessions.db')
     )
 
+    # Bot Metadata
+    bot_version: str = "0.1.16"
+
     def validate(self) -> None:
         """Validate that all required configuration values are present.
 

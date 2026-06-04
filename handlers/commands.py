@@ -1187,6 +1187,8 @@ async def set_bot_commands(app) -> None:
         BotCommand("share", "Share current session"),
         BotCommand("status", "Bot & connection status"),
         BotCommand("id", "Show your Telegram user ID"),
+        BotCommand("mcps", "List configured MCP servers"),
+        BotCommand("skills", "List and manage agent skills"),
     ]
     await app.bot.set_my_commands(commands)
     
@@ -1221,6 +1223,377 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     import os
     logger.info(f"Callback query received from user {user_id}: {data}")
+
+    # ── MCP Server Configuration Callbacks ──────────────────────────────
+    if data.startswith("mcp_toggle:"):
+        parts = data.split(":")
+        mcp_name = parts[1]
+        enabled = (parts[2] == "1")
+        
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        from utils.config_parser import toggle_mcp_server
+        toggle_mcp_server(current_dir, mcp_name, enabled)
+        
+        await query.edit_message_text(
+            f"🔄 <b>Toggling MCP server {html.escape(mcp_name)}...</b>\n"
+            f"Restarting OpenCode serve to reload configuration...",
+            parse_mode="HTML"
+        )
+        
+        await restart_opencode_serve(query, context, user_id, current_dir)
+        await render_mcps_list(query, context, user_id, current_dir)
+        return
+
+    elif data.startswith("mcp_del_ask:"):
+        mcp_name = data[len("mcp_del_ask:"):]
+        
+        warning_text = (
+            f"⚠️ <b>Delete MCP Server</b>\n\n"
+            f"Are you sure you want to delete the MCP server <code>{html.escape(mcp_name)}</code> from this workspace configuration?"
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🗑️ Yes, Delete", callback_data=f"mcp_del_confirm:{mcp_name}"),
+                InlineKeyboardButton("↩️ Cancel", callback_data="mcp_del_cancel")
+            ]
+        ]
+        await query.edit_message_text(warning_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        return
+
+    elif data.startswith("mcp_del_confirm:"):
+        mcp_name = data[len("mcp_del_confirm:"):]
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        from utils.config_parser import delete_mcp_server
+        delete_mcp_server(current_dir, mcp_name)
+        
+        await query.edit_message_text(
+            f"🗑️ <b>Deleting MCP server {html.escape(mcp_name)}...</b>\n"
+            f"Restarting OpenCode serve to reload configuration...",
+            parse_mode="HTML"
+        )
+        
+        await restart_opencode_serve(query, context, user_id, current_dir)
+        await render_mcps_list(query, context, user_id, current_dir)
+        return
+
+    elif data == "mcp_del_cancel":
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        await render_mcps_list(query, context, user_id, current_dir)
+        return
+
+    elif data == "mcp_add_start":
+        context.user_data["mcp_state"] = "waiting_for_name"
+        context.user_data["mcp_temp"] = {}
+        
+        keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="mcp_cancel")]]
+        await query.edit_message_text(
+            "📝 <b>Add MCP Server (Step 1)</b>\n\n"
+            "Please enter a unique alphanumeric name for the MCP server:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        return
+
+    elif data.startswith("mcp_type:"):
+        mcp_type = data[len("mcp_type:"):]
+        context.user_data.setdefault("mcp_temp", {})["type"] = mcp_type
+        
+        keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="mcp_cancel")]]
+        
+        if mcp_type == "local":
+            context.user_data["mcp_state"] = "waiting_for_command"
+            await query.edit_message_text(
+                "💻 <b>Enter Stdio Command (Step 3/4)</b>\n\n"
+                "Please enter the command to launch the MCP server.\n\n"
+                "📋 <b>Tap examples below to copy and edit:</b>\n\n"
+                "🔹 <i>Example 1 (Local script with arguments)</i>:\n"
+                "<code>python C:/path/to/script.py --server http://127.0.0.1:5001</code>\n\n"
+                "🔹 <i>Example 2 (Node package command with flags)</i>:\n"
+                "<code>npx -y @modelcontextprotocol/server-postgres --connection-string postgresql://localhost:5432/mydb</code>",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+        else:
+            context.user_data["mcp_state"] = "waiting_for_url"
+            await query.edit_message_text(
+                "🌐 <b>Enter Remote URL (Step 3/3)</b>\n\n"
+                "Please enter the URL of the remote MCP server.\n"
+                "Example: <code>http://127.0.0.1:8000/mcp</code>",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+        return
+
+    elif data == "mcp_cancel":
+        context.user_data.pop("mcp_state", None)
+        context.user_data.pop("mcp_temp", None)
+        await query.edit_message_text("❌ <b>MCP Server Addition Cancelled.</b>", parse_mode="HTML")
+        return
+
+    elif data == "mcp_skip_env":
+        name = context.user_data["mcp_temp"]["name"]
+        cmd_args = context.user_data["mcp_temp"]["command"]
+        
+        mcp_config = {
+            "type": "local",
+            "command": cmd_args,
+            "enabled": True
+        }
+        
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        from utils.config_parser import add_mcp_server
+        add_mcp_server(current_dir, name, mcp_config)
+        
+        # Reset state immediately
+        context.user_data.pop("mcp_state", None)
+        context.user_data.pop("mcp_temp", None)
+        
+        await query.edit_message_text(
+            f"🚀 <b>Adding MCP server <code>{html.escape(name)}</code>...</b>\n"
+            f"Restarting OpenCode serve to reload configuration...",
+            parse_mode="HTML"
+        )
+        
+        await restart_opencode_serve(query, context, user_id, current_dir)
+        await render_mcps_list(query, context, user_id, current_dir)
+        return
+
+    elif data == "mcp_refresh":
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        await query.edit_message_text(
+            "🔄 <b>Reloading and reconnecting MCP servers...</b>\n"
+            "Restarting OpenCode serve to physically recheck connections...",
+            parse_mode="HTML"
+        )
+        
+        await restart_opencode_serve(query, context, user_id, current_dir)
+        await render_mcps_list(query, context, user_id, current_dir)
+        return
+
+    elif data.startswith("mcp_list_page:"):
+        page = int(data.split(":")[1])
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        await render_mcps_list(query, context, user_id, current_dir, page=page)
+        return
+
+    # ── Agent Skill Configuration Callbacks ──────────────────────────────
+    elif data.startswith("skill_detail:"):
+        parts = data.split(":")
+        scope = parts[1]
+        skill_name = parts[2]
+        
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        await render_skill_detail(query, context, user_id, current_dir, scope, skill_name)
+        return
+
+    elif data.startswith("skill_view_full:"):
+        parts = data.split(":")
+        scope = parts[1]
+        skill_name = parts[2]
+        page = int(parts[3]) if len(parts) > 3 else 0
+        
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        await render_skill_full(query, context, user_id, current_dir, scope, skill_name, page)
+        return
+
+
+
+
+
+
+    elif data.startswith("skill_perm:"):
+        parts = data.split(":")
+        scope = parts[1]
+        skill_name = parts[2]
+        level = parts[3]
+        
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        from utils.config_parser import set_skill_permission
+        set_skill_permission(current_dir, skill_name, level)
+        
+        await query.edit_message_text(
+            f"🔄 <b>Setting skill {html.escape(skill_name)} permission to {level}...</b>\n"
+            f"Restarting OpenCode serve to reload configuration...",
+            parse_mode="HTML"
+        )
+        
+        await restart_opencode_serve(query, context, user_id, current_dir)
+        await render_skill_detail(query, context, user_id, current_dir, scope, skill_name)
+        return
+
+    elif data.startswith("skill_del_ask:"):
+        parts = data.split(":")
+        scope = parts[1]
+        skill_name = parts[2]
+        
+        warning_text = (
+            f"⚠️ <b>Delete Skill</b>\n\n"
+            f"Are you sure you want to delete the skill <code>{html.escape(skill_name)}</code> ({html.escape(scope)})?\n\n"
+            f"This will permanently erase its folder and SKILL.md file from disk."
+        )
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("🗑️ Yes, Delete", callback_data=f"skill_del_confirm:{scope}:{skill_name}"),
+                InlineKeyboardButton("↩️ Cancel", callback_data=f"skill_detail:{scope}:{skill_name}")
+            ]
+        ]
+        await query.edit_message_text(warning_text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        return
+
+    elif data.startswith("skill_del_confirm:"):
+        parts = data.split(":")
+        scope = parts[1]
+        skill_name = parts[2]
+        
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        from utils.skill_manager import delete_skill
+        from utils.config_parser import delete_skill_permission
+        
+        # Delete from disk and remove from permission config
+        delete_skill(current_dir, scope, skill_name)
+        delete_skill_permission(current_dir, skill_name)
+        
+        await query.edit_message_text(
+            f"🗑️ <b>Deleting skill {html.escape(skill_name)}...</b>\n"
+            f"Restarting OpenCode serve to reload configuration...",
+            parse_mode="HTML"
+        )
+        
+        await restart_opencode_serve(query, context, user_id, current_dir)
+        await render_skills_list(query, context, user_id, current_dir)
+        return
+
+    elif data == "skill_back" or data == "skill_del_cancel":
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        await render_skills_list(query, context, user_id, current_dir)
+        return
+
+    elif data == "skill_refresh":
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        await render_skills_list(query, context, user_id, current_dir)
+        return
+
+    elif data.startswith("skill_list_page:"):
+        page = int(data.split(":")[1])
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        await render_skills_list(query, context, user_id, current_dir, page=page)
+        return
+
+    elif data == "skill_add_start":
+        keyboard = [
+            [
+                InlineKeyboardButton("📁 Direct File Upload", callback_data="skill_add_method:upload"),
+                InlineKeyboardButton("🌐 Import from URL / Git", callback_data="skill_add_method:import")
+            ],
+            [InlineKeyboardButton("↩️ Cancel", callback_data="skill_cancel")]
+        ]
+        await query.edit_message_text(
+            "➕ <b>Add Skill</b>\n\n"
+            "Please choose how you would like to add the new skill:\n\n"
+            "📁 <b>Direct File Upload</b>: Upload a <code>SKILL.md</code> file directly. The skill name is automatically parsed from the file's frontmatter.\n"
+            "🌐 <b>Import from URL / Git</b>: Import custom skills dynamically from a GitHub repository or public raw file URL.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        return
+
+    elif data.startswith("skill_add_method:"):
+        method = data[len("skill_add_method:"):]
+        keyboard = [
+            [
+                InlineKeyboardButton("🌐 Global Skill", callback_data=f"skill_scope_{method}:global"),
+                InlineKeyboardButton("📁 Local Skill", callback_data=f"skill_scope_{method}:local")
+            ],
+            [InlineKeyboardButton("↩️ Back", callback_data="skill_add_start")]
+        ]
+        
+        method_title = "Direct File Upload" if method == "upload" else "Git/URL Import"
+        await query.edit_message_text(
+            f"➕ <b>Add Skill - {method_title}</b>\n\n"
+            "Please select the target scope for the new skill:\n\n"
+            "🌐 <b>Global Skills</b> are stored in the user config directory and available across all projects.\n"
+            "📁 <b>Local Skills</b> are stored in the active workspace directory and isolated to this workspace.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        return
+
+    elif data.startswith("skill_scope_upload:"):
+        scope = data[len("skill_scope_upload:"):]
+        context.user_data["skill_temp"] = {"scope": scope, "method": "upload"}
+        context.user_data["skill_state"] = "waiting_for_skill_file"
+        
+        keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="skill_cancel")]]
+        await query.edit_message_text(
+            f"📁 <b>Add Skill - Upload File</b>\n\n"
+            f"• Scope: <code>{scope.capitalize()}</code>\n\n"
+            f"Please attach and send your skill file (e.g. <code>SKILL.md</code> or any text file).\n\n"
+            f"💡 <i>Note: The bot will automatically read the skill's name and description from the file's frontmatter headers and configure the folder.</i>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        return
+
+    elif data.startswith("skill_scope_import:"):
+        scope = data[len("skill_scope_import:"):]
+        context.user_data["skill_temp"] = {"scope": scope, "method": "import"}
+        context.user_data["skill_state"] = "waiting_for_import_url"
+        
+        keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="skill_cancel")]]
+        await query.edit_message_text(
+            f"📝 <b>Add Skill - Git/URL Import</b>\n\n"
+            f"• Scope: <code>{scope.capitalize()}</code>\n\n"
+            f"Please enter the GitHub repository URL or a raw public markdown file URL:\n\n"
+            f"💡 <i>Example: <code>https://github.com/username/my-skills</code> or a raw Gist link.</i>",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        return
+
+    elif data == "skill_cancel":
+        context.user_data.pop("skill_state", None)
+        context.user_data.pop("skill_temp", None)
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        await render_skills_list(query, context, user_id, current_dir)
+        return
 
     # 1. Switch Session tap
     if data.startswith("sess:"):
@@ -1881,3 +2254,457 @@ async def delete_project_command(update: Update, context: ContextTypes.DEFAULT_T
     
     await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
 
+
+
+async def render_mcps_list(update_or_query, context, user_id, current_dir, page=None) -> None:
+    """Render the list of configured MCP servers with toggle and delete actions."""
+    import html
+    import math
+    
+    if page is None:
+        page = context.user_data.get("mcps_page", 1)
+    else:
+        context.user_data["mcps_page"] = page
+        
+    oc_client = context.bot_data["opencode_client"]
+    
+    from utils.config_parser import get_mcp_servers
+    mcp_config = get_mcp_servers(current_dir) or {}
+
+    live_status = {}
+    try:
+        live_status = await oc_client.get_mcp_status()
+    except Exception as e:
+        logger.warning(f"Could not fetch live MCP status from server: {e}")
+
+    connected_servers = {}
+    if isinstance(live_status, list):
+        for s in live_status:
+            if isinstance(s, dict):
+                name = s.get("name")
+                if name:
+                    connected_servers[name] = s
+    elif isinstance(live_status, dict):
+        servers = live_status.get("servers") or live_status.get("data")
+        if servers:
+            if isinstance(servers, list):
+                for s in servers:
+                    if isinstance(s, dict):
+                        name = s.get("name")
+                        if name:
+                            connected_servers[name] = s
+            elif isinstance(servers, dict):
+                connected_servers = servers
+        else:
+            connected_servers = live_status
+
+    total_mcps = len(mcp_config)
+    page_size = 6
+    total_pages = math.ceil(total_mcps / page_size)
+    if total_pages == 0:
+        total_pages = 1
+        
+    # Clamp page
+    if page > total_pages:
+        page = total_pages
+    if page < 1:
+        page = 1
+    context.user_data["mcps_page"] = page
+
+    lines = [
+        "<b>🛠️ Model Context Protocol (MCP) Servers</b>\n",
+        f"📍 <i>Workspace: {html.escape(os.path.basename(current_dir) or 'Root')}</i>\n"
+    ]
+
+    if not mcp_config:
+        lines.append("📭 <i>No MCP servers configured in this workspace yet.</i>\n")
+        lines.append("Use /add_mcp to register a new stdio or remote MCP server!")
+    else:
+        lines.append(f"Configured MCP servers (Page {page}/{total_pages}):\n")
+        # Slice config keys for pagination
+        mcp_keys = sorted(mcp_config.keys())
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        page_keys = mcp_keys[start_idx:end_idx]
+        
+        for name in page_keys:
+            info = mcp_config[name]
+            is_enabled = info.get("enabled", True)
+            mcp_type = info.get("type", "local")
+
+            status_icon = "🟢" if is_enabled else "🔴"
+            status_text = "Enabled" if is_enabled else "Disabled"
+
+            conn_icon = ""
+            if is_enabled:
+                live_info = connected_servers.get(name, {})
+                status = live_info.get("status")
+                if status:
+                    is_connected = status in ("connected", "healthy", "running")
+                else:
+                    is_connected = live_info.get("connected", False)
+                
+                if is_connected:
+                    conn_icon = " 🔗 (Connected)"
+                else:
+                    conn_icon = " ⚠️ (Disconnected)"
+
+            type_display = "💻 Stdio (Local)" if mcp_type == "local" else "🌐 Remote (SSE)"
+
+            lines.append(f"{status_icon} <b>{html.escape(name)}</b> {conn_icon}")
+            lines.append(f"   • Type: <code>{type_display}</code>")
+            
+            if mcp_type == "local":
+                cmd_list = info.get("command", [])
+                cmd_str = " ".join(cmd_list) if isinstance(cmd_list, list) else str(cmd_list)
+                lines.append(f"   • Command: <code>{html.escape(cmd_str)}</code>")
+            else:
+                lines.append(f"   • URL: <code>{html.escape(info.get('url', ''))}</code>")
+            
+            lines.append("")
+
+    keyboard = []
+    if mcp_config:
+        mcp_keys = sorted(mcp_config.keys())
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        page_keys = mcp_keys[start_idx:end_idx]
+        
+        for name in page_keys:
+            info = mcp_config[name]
+            is_enabled = info.get("enabled", True)
+            toggle_label = "🔴 Disable" if is_enabled else "🟢 Enable"
+            
+            keyboard.append([
+                InlineKeyboardButton(f"{toggle_label} {name}", callback_data=f"mcp_toggle:{name}:{int(not is_enabled)}"),
+                InlineKeyboardButton(f"🗑️ Delete", callback_data=f"mcp_del_ask:{name}")
+            ])
+            
+    # Add pagination controls row if there's more than 1 page
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev Page", callback_data=f"mcp_list_page:{page - 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+            
+        nav_buttons.append(InlineKeyboardButton(f"Page {page}/{total_pages}", callback_data="noop"))
+        
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton("Next Page ➡️", callback_data=f"mcp_list_page:{page + 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+        keyboard.append(nav_buttons)
+            
+    keyboard.append([
+        InlineKeyboardButton("🔄 Refresh Status", callback_data="mcp_refresh"),
+        InlineKeyboardButton("➕ Add MCP Server", callback_data="mcp_add_start")
+    ])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    is_query = hasattr(update_or_query, "edit_message_text")
+    if is_query:
+        await update_or_query.edit_message_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
+    else:
+        await update_or_query.message.reply_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
+
+
+async def mcps_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List configured MCP servers and their statuses."""
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    config = context.bot_data["config"]
+
+    # Ensure OpenCode server is running
+    from handlers.messages import ensure_server_running
+    if not await ensure_server_running(update, context, user_id):
+        return
+
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+    current_dir = os.path.abspath(current_dir)
+
+    context.user_data["mcps_page"] = 1
+    await render_mcps_list(update, context, user_id, current_dir, page=1)
+
+
+async def render_skills_list(update_or_query, context, user_id, current_dir, page=None) -> None:
+    """Render the list of configured skills with metadata and permissions."""
+    import html
+    import math
+    
+    if page is None:
+        page = context.user_data.get("skills_page", 1)
+    else:
+        context.user_data["skills_page"] = page
+        
+    from utils.skill_manager import get_skills
+    skills = get_skills(current_dir)
+    
+    total_skills = len(skills)
+    page_size = 8
+    total_pages = math.ceil(total_skills / page_size)
+    if total_pages == 0:
+        total_pages = 1
+        
+    # Clamp page
+    if page > total_pages:
+        page = total_pages
+    if page < 1:
+        page = 1
+    context.user_data["skills_page"] = page
+    
+    lines = [
+        "<b>💡 Agent Skills Management</b>\n",
+        f"📍 <i>Workspace: {html.escape(os.path.basename(current_dir) or 'Root')}</i>\n"
+    ]
+    
+    if not skills:
+        lines.append("📭 <i>No skills configured yet.</i>\n")
+        lines.append("Use the button below to create a new agent skill!")
+    else:
+        # Get subset of skills for current page
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        page_skills = skills[start_idx:end_idx]
+        
+        lines.append(f"Select a skill below to configure permissions, view prompts, or edit/delete it (Page {page}/{total_pages}):\n")
+        for skill in page_skills:
+            name = skill["name"]
+            desc = skill["description"]
+            if len(desc) > 100:
+                desc = desc[:97] + "..."
+            scope = skill["scope"]
+            perm = skill["permission"]
+            
+            scope_icon = "🌐" if scope == "global" else "📁"
+            scope_display = "Global" if scope == "global" else "Local"
+            
+            perm_icon = "🟢" if perm == "allow" else ("🔴" if perm == "deny" else "🟡")
+            perm_display = "Allowed" if perm == "allow" else ("Denied" if perm == "deny" else "Ask")
+            
+            lines.append(f"{perm_icon} <b>{html.escape(name)}</b> ({scope_icon} {scope_display}) — <code>{perm_display}</code>")
+            lines.append(f"   <i>{html.escape(desc)}</i>\n")
+            
+    keyboard = []
+    if skills:
+        start_idx = (page - 1) * page_size
+        end_idx = start_idx + page_size
+        page_skills = skills[start_idx:end_idx]
+        for skill in page_skills:
+            name = skill["name"]
+            scope = skill["scope"]
+            
+            scope_icon = "🌐" if scope == "global" else "📁"
+            keyboard.append([
+                InlineKeyboardButton(f"{scope_icon} {name}", callback_data=f"skill_detail:{scope}:{name}")
+            ])
+            
+    # Add pagination controls row if there's more than 1 page
+    if total_pages > 1:
+        nav_buttons = []
+        if page > 1:
+            nav_buttons.append(InlineKeyboardButton("⬅️ Prev Page", callback_data=f"skill_list_page:{page - 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+            
+        nav_buttons.append(InlineKeyboardButton(f"Page {page}/{total_pages}", callback_data="noop"))
+        
+        if page < total_pages:
+            nav_buttons.append(InlineKeyboardButton("Next Page ➡️", callback_data=f"skill_list_page:{page + 1}"))
+        else:
+            nav_buttons.append(InlineKeyboardButton("⏹️", callback_data="noop"))
+        keyboard.append(nav_buttons)
+            
+    keyboard.append([
+        InlineKeyboardButton("🔄 Refresh List", callback_data="skill_refresh"),
+        InlineKeyboardButton("➕ Add Skill", callback_data="skill_add_start")
+    ])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    is_query = hasattr(update_or_query, "edit_message_text")
+    if is_query:
+        await update_or_query.edit_message_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
+    else:
+        await update_or_query.message.reply_text("\n".join(lines), reply_markup=reply_markup, parse_mode="HTML")
+
+
+async def render_skill_detail(update_or_query, context, user_id, current_dir, scope, name) -> None:
+    """Render details page for a specific skill with Allow/Deny/Ask controls."""
+    import html
+    from utils.skill_manager import get_skills
+    
+    skills = get_skills(current_dir)
+    target_skill = None
+    for s in skills:
+        if s["name"] == name and s["scope"] == scope:
+            target_skill = s
+            break
+            
+    if not target_skill:
+        is_query = hasattr(update_or_query, "edit_message_text")
+        if is_query:
+            await update_or_query.answer("Skill not found.", show_alert=True)
+        await render_skills_list(update_or_query, context, user_id, current_dir)
+        return
+        
+    desc = target_skill["description"]
+    perm = target_skill["permission"]
+    content = target_skill["content"]
+    
+    scope_icon = "🌐" if scope == "global" else "📁"
+    scope_display = "Global" if scope == "global" else "Local"
+    
+    perm_icon = "🟢" if perm == "allow" else ("🔴" if perm == "deny" else "🟡")
+    perm_display = "Allowed" if perm == "allow" else ("Denied" if perm == "deny" else "Ask")
+    
+    lines = [
+        f"💡 <b>Agent Skill: {html.escape(name)}</b> ({scope_icon} {scope_display})",
+        "",
+        f"• <b>Permission:</b> {perm_icon} <code>{perm_display}</code>",
+        f"• <b>Description:</b> <i>{html.escape(desc)}</i>",
+        ""
+    ]
+    
+    lines.append("📝 <b>Instructions Preview:</b>")
+    preview = content.strip()
+    if len(preview) > 300:
+        preview = preview[:297] + "..."
+    
+    lines.append(f"<code>{html.escape(preview)}</code>")
+    
+    allow_label = "✅ Allow" if perm == "allow" else "🟢 Allow"
+    deny_label = "✅ Deny" if perm == "deny" else "🔴 Deny"
+    ask_label = "✅ Ask" if perm == "ask" else "🟡 Ask"
+    
+    keyboard = [
+        [
+            InlineKeyboardButton(allow_label, callback_data=f"skill_perm:{scope}:{name}:allow"),
+            InlineKeyboardButton(deny_label, callback_data=f"skill_perm:{scope}:{name}:deny"),
+            InlineKeyboardButton(ask_label, callback_data=f"skill_perm:{scope}:{name}:ask")
+        ],
+        [
+            InlineKeyboardButton("🔍 View Full Skill", callback_data=f"skill_view_full:{scope}:{name}:0")
+        ],
+        [
+            InlineKeyboardButton("🗑️ Delete Skill", callback_data=f"skill_del_ask:{scope}:{name}")
+        ],
+        [
+            InlineKeyboardButton("↩️ Back to List", callback_data="skill_back")
+        ]
+    ]
+    
+    is_query = hasattr(update_or_query, "edit_message_text")
+    if is_query:
+        await update_or_query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+    else:
+        await update_or_query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+
+async def render_skill_full(update_or_query, context, user_id, current_dir, scope, name, page=0) -> None:
+    """Render full instructions for a specific skill with pagination support."""
+    import html
+    import math
+    from utils.skill_manager import get_skills
+    
+    skills = get_skills(current_dir)
+    target_skill = None
+    for s in skills:
+        if s["name"] == name and s["scope"] == scope:
+            target_skill = s
+            break
+            
+    if not target_skill:
+        is_query = hasattr(update_or_query, "edit_message_text")
+        if is_query:
+            await update_or_query.answer("Skill not found.", show_alert=True)
+        await render_skills_list(update_or_query, context, user_id, current_dir)
+        return
+        
+    skill_path = os.path.join(target_skill["path"], "SKILL.md")
+    try:
+        with open(skill_path, "r", encoding="utf-8") as f:
+            full_content = f.read()
+    except Exception:
+        full_content = target_skill["content"]
+        
+    # Paginate by 3500 character boundaries to stay safely under Telegram limits
+    page_size = 3500
+    total_chars = len(full_content)
+    total_pages = math.ceil(total_chars / page_size)
+    if total_pages == 0:
+        total_pages = 1
+        
+    # Clamp page index safely
+    page = max(0, min(page, total_pages - 1))
+    
+    start_idx = page * page_size
+    end_idx = min(start_idx + page_size, total_chars)
+    page_content = full_content[start_idx:end_idx]
+    
+    lines = [
+        f"📄 <b>Full Skill File: <code>{html.escape(name)}/SKILL.md</code></b> ({scope.capitalize()})",
+        f"📖 <i>Page {page + 1} of {total_pages}</i>\n",
+        f"<pre>{html.escape(page_content)}</pre>"
+    ]
+    
+    # 1. Navigation controls row
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev Page", callback_data=f"skill_view_full:{scope}:{name}:{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton("Next Page ➡️", callback_data=f"skill_view_full:{scope}:{name}:{page + 1}"))
+        
+    keyboard = []
+    if nav_row:
+        keyboard.append(nav_row)
+        
+    keyboard.append([
+        InlineKeyboardButton("↩️ Back to Detail", callback_data=f"skill_detail:{scope}:{name}")
+    ])
+    
+    is_query = hasattr(update_or_query, "edit_message_text")
+    if is_query:
+        await update_or_query.edit_message_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+    else:
+        await update_or_query.message.reply_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+
+
+
+
+async def skills_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """List configured agent skills and their status/permissions."""
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    config = context.bot_data["config"]
+    
+    # Ensure OpenCode server is running dynamically
+    from handlers.messages import ensure_server_running
+    if not await ensure_server_running(update, context, user_id):
+        return
+        
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+    current_dir = os.path.abspath(current_dir)
+    
+    context.user_data["skills_page"] = 1
+    await render_skills_list(update, context, user_id, current_dir, page=1)
+
+
+async def restart_opencode_serve(update_or_query, context, user_id, work_dir) -> bool:
+    """Helper to restart the local OpenCode serve process inside the target folder."""
+    config = context.bot_data["config"]
+    from urllib.parse import urlparse
+    try:
+        url_parsed = urlparse(config.opencode_server_url)
+        hostname = url_parsed.hostname or "127.0.0.1"
+        port = url_parsed.port or 8080
+    except Exception:
+        hostname = "127.0.0.1"
+        port = 8080
+
+    from opencode.server import restart_server
+    success = await restart_server(work_dir, port=port, hostname=hostname)
+    if success:
+        context.bot_data["server_started"] = True
+    return success

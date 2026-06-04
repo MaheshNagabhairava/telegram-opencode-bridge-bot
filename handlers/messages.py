@@ -104,6 +104,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = user.id
     message_text = sanitize_input(update.message.text or "")
 
+    # ── Check if user is in the middle of adding an MCP server ───────
+    mcp_state = context.user_data.get("mcp_state")
+    if mcp_state:
+        await handle_mcp_input(update, context, mcp_state)
+        return
+
+    # ── Check if user is in the middle of adding an agent skill ──────
+    skill_state = context.user_data.get("skill_state")
+    if skill_state:
+        await handle_skill_input(update, context, skill_state)
+        return
+
     if not message_text or not message_text.strip():
         return
 
@@ -754,6 +766,127 @@ async def _listen_and_stream_events(
             retry_delay = min(retry_delay * 2, 10.0)
 
 
+async def handle_skill_file_upload(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Save the uploaded file as SKILL.md in the skill directory, parsing the name dynamically from YAML frontmatter."""
+    import os
+    import html
+    import re
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    config = context.bot_data["config"]
+    
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("⚠️ Please upload a valid document file (markdown or text).")
+        return
+        
+    file_id = document.file_id
+    new_file = await context.bot.get_file(file_id)
+    
+    import tempfile
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = os.path.join(temp_dir, "temp_skill.md")
+        await new_file.download_to_drive(temp_path)
+        
+        with open(temp_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            
+    scope = context.user_data["skill_temp"]["scope"]
+    
+    # Parse the frontmatter to extract the name
+    from utils.skill_manager import parse_frontmatter, get_skills, get_skills_dir
+    meta = parse_frontmatter(content)
+    name = meta.get("name")
+    
+    keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="skill_cancel")]]
+    
+    if not name:
+        await update.message.reply_text(
+            "⚠️ <b>Missing name header:</b> The uploaded file must contain a <code>name:</code> header in its frontmatter headers block.\n\n"
+            "Example at the top of your file:\n"
+            "<pre>---\n"
+            "name: my-cool-skill\n"
+            "description: A short description\n"
+            "---\n\n"
+            "Please fix the headers in your file and upload it again:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        return
+        
+    # Validate name format
+    name = name.strip()
+    if not re.match(r"^[a-zA-Z0-9\-_]+$", name):
+        await update.message.reply_text(
+            f"⚠️ <b>Invalid skill name in header:</b> <code>{html.escape(name)}</code>.\n"
+            "Name must contain only alphanumeric characters, hyphens, or underscores.\n\n"
+            "Please correct the <code>name:</code> header in your file and upload it again:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        return
+        
+    base_dir = os.path.abspath(config.opencode_work_dir)
+    current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+    current_dir = os.path.abspath(current_dir)
+    
+    # Check for duplicate names in scope
+    existing_skills = get_skills(current_dir)
+    is_duplicate = False
+    for s in existing_skills:
+        if s["name"].lower() == name.lower() and s["scope"] == scope:
+            is_duplicate = True
+            break
+            
+    if is_duplicate:
+        await update.message.reply_text(
+            f"⚠️ <b>Duplicate name:</b> A skill named <code>{html.escape(name)}</code> already exists in the <b>{scope}</b> scope.\n\n"
+            "Please edit the <code>name:</code> header in your file and upload it again:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        return
+        
+    s_dir = get_skills_dir(current_dir, scope)
+    skill_folder = os.path.join(s_dir, name)
+    os.makedirs(skill_folder, exist_ok=True)
+    skill_path = os.path.join(skill_folder, "SKILL.md")
+    
+    # Write the uploaded content directly as SKILL.md
+    try:
+        with open(skill_path, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        await update.message.reply_text(
+            f"⚠️ <b>Failed to save skill file:</b> {html.escape(str(e))}\n\nPlease try again:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        return
+        
+    # Clean up state
+    context.user_data.pop("skill_state", None)
+    context.user_data.pop("skill_temp", None)
+    
+    status_msg = await update.message.reply_text(
+        f"🚀 <b>Skill <code>{html.escape(name)}</code> uploaded and configured successfully!</b>\n"
+        f"Restarting OpenCode serve to reload configuration...",
+        parse_mode="HTML"
+    )
+    
+    from handlers.commands import restart_opencode_serve, render_skill_detail
+    await restart_opencode_serve(update, context, user_id, current_dir)
+    
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+        
+    await render_skill_detail(update, context, user_id, current_dir, scope, name)
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming file uploads (documents and gallery photos) from Telegram,
     download them to the active workspace, and trigger the OpenCode agent for analysis.
@@ -761,6 +894,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
     user_id = user.id
     
+    # Intercept file uploads if we are waiting for a skill file upload
+    state = context.user_data.get("skill_state")
+    if state == "waiting_for_skill_file":
+        await handle_skill_file_upload(update, context)
+        return
+        
     document = update.message.document
     photo_list = update.message.photo
 
@@ -1027,3 +1166,323 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         
         await update.message.reply_text(confirmation, parse_mode="HTML")
+
+
+async def handle_mcp_input(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str) -> None:
+    """Processes step-by-step text messages for adding an MCP server."""
+    import re
+    import html
+    import shlex
+    
+    user_id = update.effective_user.id
+    bot_data = context.bot_data
+    session_mgr = bot_data["session_manager"]
+    config = bot_data["config"]
+    
+    # Ensure mcp_temp dictionary exists
+    context.user_data.setdefault("mcp_temp", {})
+    
+    if state == "waiting_for_name":
+        name = (update.message.text or "").strip()
+        if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+            keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="mcp_cancel")]]
+            await update.message.reply_text(
+                "⚠️ <b>Invalid name format.</b> Please use only letters, numbers, hyphens, and underscores (no spaces).\n\n"
+                "Please enter the MCP server name again:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+            return
+            
+        # Check if already exists in configurations
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        from utils.config_parser import get_mcp_servers
+        existing_mcps = get_mcp_servers(current_dir)
+        if name in existing_mcps:
+            keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="mcp_cancel")]]
+            await update.message.reply_text(
+                f"⚠️ An MCP server named <code>{html.escape(name)}</code> already exists in this workspace config.\n\n"
+                f"Please enter a different name:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+            return
+            
+        context.user_data["mcp_temp"]["name"] = name
+        context.user_data["mcp_state"] = "waiting_for_type"
+        
+        keyboard = [
+            [
+                InlineKeyboardButton("💻 Stdio (Local Command)", callback_data="mcp_type:local"),
+                InlineKeyboardButton("🌐 Remote (SSE Web URL)", callback_data="mcp_type:remote")
+            ],
+            [InlineKeyboardButton("↩️ Cancel", callback_data="mcp_cancel")]
+        ]
+        await update.message.reply_text(
+            f"📝 <b>Add MCP Server (Step 2)</b>\n\n"
+            f"• Name: <code>{html.escape(name)}</code>\n\n"
+            f"Select the connection type for this MCP server:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        
+    elif state == "waiting_for_type":
+        # User is expected to tap an inline keyboard button. If they enter text, prompt them.
+        keyboard = [
+            [
+                InlineKeyboardButton("💻 Stdio (Local Command)", callback_data="mcp_type:local"),
+                InlineKeyboardButton("🌐 Remote (SSE Web URL)", callback_data="mcp_type:remote")
+            ],
+            [InlineKeyboardButton("↩️ Cancel", callback_data="mcp_cancel")]
+        ]
+        await update.message.reply_text(
+            "⚠️ Please select the connection type using the buttons below, or tap Cancel:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        
+    elif state == "waiting_for_command":
+        cmd_str = (update.message.text or "").strip()
+        try:
+            cmd_args = shlex.split(cmd_str)
+        except Exception as e:
+            keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="mcp_cancel")]]
+            await update.message.reply_text(
+                f"⚠️ <b>Invalid command syntax:</b> {html.escape(str(e))}\n\n"
+                f"Please enter the command again:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+            return
+            
+        if not cmd_args:
+            keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="mcp_cancel")]]
+            await update.message.reply_text(
+                "⚠️ Command cannot be empty. Please enter a valid execution command:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+            return
+            
+        # Save command in memory & proceed to optional environment variables step
+        context.user_data["mcp_temp"]["command"] = cmd_args
+        context.user_data["mcp_state"] = "waiting_for_env"
+        
+        keyboard = [
+            [InlineKeyboardButton("⏭️ Skip & Save", callback_data="mcp_skip_env")],
+            [InlineKeyboardButton("↩️ Cancel", callback_data="mcp_cancel")]
+        ]
+        await update.message.reply_text(
+            "🔑 <b>Optional: Environment Variables (Step 4/4)</b>\n\n"
+            "If this MCP server requires API keys or custom credentials, please enter them in <code>KEY=VALUE</code> format.\n\n"
+            "📋 <b>Tap to copy example</b>:\n"
+            "<code>GITHUB_PERSONAL_ACCESS_TOKEN=ghp_abc123</code>\n\n"
+            "<i>If entering multiple variables, separate them with spaces or newlines, e.g.</i>:\n"
+            "<code>KEY1=VAL1 KEY2=VAL2</code>\n\n"
+            "Tap <b>Skip & Save</b> below if no environment variables are needed.",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="HTML"
+        )
+        
+    elif state == "waiting_for_env":
+        env_str = (update.message.text or "").strip()
+        
+        # Parse environment variables securely
+        env_dict = {}
+        if env_str:
+            try:
+                tokens = shlex.split(env_str)
+            except Exception:
+                tokens = env_str.replace('\n', ' ').split()
+                
+            for token in tokens:
+                if '=' in token:
+                    k, v = token.split('=', 1)
+                    k = k.strip()
+                    v = v.strip().strip('"\'')
+                    if k:
+                        env_dict[k] = v
+                        
+        name = context.user_data["mcp_temp"]["name"]
+        cmd_args = context.user_data["mcp_temp"]["command"]
+        
+        mcp_config = {
+            "type": "local",
+            "command": cmd_args,
+            "enabled": True
+        }
+        if env_dict:
+            mcp_config["env"] = env_dict
+            
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        from utils.config_parser import add_mcp_server
+        add_mcp_server(current_dir, name, mcp_config)
+        
+        # Reset state immediately to avoid double-processing
+        context.user_data.pop("mcp_state", None)
+        context.user_data.pop("mcp_temp", None)
+        
+        status_msg = await update.message.reply_text(
+            f"🚀 <b>Adding MCP server <code>{html.escape(name)}</code>...</b>\n"
+            f"Restarting OpenCode serve to reload configuration...",
+            parse_mode="HTML"
+        )
+        
+        from handlers.commands import restart_opencode_serve, render_mcps_list
+        await restart_opencode_serve(update, context, user_id, current_dir)
+        
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+            
+        await render_mcps_list(update, context, user_id, current_dir)
+        
+    elif state == "waiting_for_url":
+        url = (update.message.text or "").strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="mcp_cancel")]]
+            await update.message.reply_text(
+                "⚠️ <b>Invalid URL format.</b> The remote SSE URL must start with <code>http://</code> or <code>https://</code>\n\n"
+                "Please enter the URL again:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+            return
+            
+        name = context.user_data["mcp_temp"]["name"]
+        
+        mcp_config = {
+            "type": "remote",
+            "url": url,
+            "enabled": True
+        }
+        
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        from utils.config_parser import add_mcp_server
+        add_mcp_server(current_dir, name, mcp_config)
+        
+        # Reset state immediately
+        context.user_data.pop("mcp_state", None)
+        context.user_data.pop("mcp_temp", None)
+        
+        status_msg = await update.message.reply_text(
+            f"🚀 <b>Adding MCP server <code>{html.escape(name)}</code>...</b>\n"
+            f"Restarting OpenCode serve to reload configuration...",
+            parse_mode="HTML"
+        )
+        
+        from handlers.commands import restart_opencode_serve, render_mcps_list
+        await restart_opencode_serve(update, context, user_id, current_dir)
+        
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+            
+        await render_mcps_list(update, context, user_id, current_dir)
+
+
+async def handle_skill_input(update: Update, context: ContextTypes.DEFAULT_TYPE, state: str) -> None:
+    """Handle message input for the new agent skill registration wizard."""
+    import os
+    import html
+    import re
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    from handlers.commands import render_skills_list, restart_opencode_serve
+    
+    user_id = update.effective_user.id
+    session_mgr = context.bot_data["session_manager"]
+    config = context.bot_data["config"]
+    
+    if state == "waiting_for_import_url":
+        url = (update.message.text or "").strip()
+        if not url:
+            keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="skill_cancel")]]
+            await update.message.reply_text(
+                "⚠️ URL cannot be empty. Please enter a valid URL:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+            return
+            
+        scope = context.user_data["skill_temp"]["scope"]
+        
+        status_msg = await update.message.reply_text(
+            f"📥 <b>Importing skill from URL...</b>\n"
+            f"Please wait while we clone/fetch the repository files.",
+            parse_mode="HTML"
+        )
+        
+        base_dir = os.path.abspath(config.opencode_work_dir)
+        current_dir = await session_mgr.get_user_work_dir(user_id, base_dir)
+        current_dir = os.path.abspath(current_dir)
+        
+        from utils.skill_manager import import_skill_from_url
+        try:
+            imported = import_skill_from_url(url, scope, current_dir)
+        except Exception as e:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+            keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="skill_cancel")]]
+            await update.message.reply_text(
+                f"❌ <b>Import Failed:</b> {html.escape(str(e))}\n\nPlease enter the URL again:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+            return
+            
+        try:
+            await status_msg.delete()
+        except Exception:
+            pass
+            
+        if not imported:
+            keyboard = [[InlineKeyboardButton("↩️ Cancel", callback_data="skill_cancel")]]
+            await update.message.reply_text(
+                "⚠️ No <code>SKILL.md</code> files were found in the provided repository.\n"
+                "Please enter a different URL:",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode="HTML"
+            )
+            return
+            
+        # Reset state
+        context.user_data.pop("skill_state", None)
+        context.user_data.pop("skill_temp", None)
+        
+        # Trigger OpenCode reload
+        reload_msg = await update.message.reply_text(
+            f"🚀 <b>Imported skill(s):</b> {', '.join(imported)}\n"
+            f"Restarting OpenCode serve to reload configuration...",
+            parse_mode="HTML"
+        )
+        
+        await restart_opencode_serve(update, context, user_id, current_dir)
+        
+        try:
+            await reload_msg.delete()
+        except Exception:
+            pass
+            
+        # Send final success and render the skills list
+        await update.message.reply_text(
+            f"✅ <b>Successfully imported {len(imported)} skill(s)!</b>\n"
+            f"• Scope: <code>{scope.capitalize()}</code>\n"
+            f"• Skills: <code>{', '.join(imported)}</code>",
+            parse_mode="HTML"
+        )
+        
+        await render_skills_list(update, context, user_id, current_dir)
+

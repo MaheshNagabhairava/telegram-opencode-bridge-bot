@@ -18,6 +18,8 @@ A premium, feature-rich Python bot that bridges your Telegram client directly to
 - **Live Tool Execution Streaming** — Watch the agent interact with your filesystem, write code, run bash commands, and search the web in real-time (`/enable` / `/disable`).
 - **Flexible Model & Agent Mode Selectors** — Swap underlying LLM models on the fly (`/models`) and switch agent personas (e.g. Build, Plan, or Webtester) using clean interactive menus (`/mode`).
 - **Secure by Default** — Enforces a strict user whitelist check on every message and callback action to prevent unauthorized access.
+- **Agent Skills Management (`/skills`)** — Organize specialized instruction prompts. Supports direct file uploads (automatic name extraction from YAML frontmatter) and URL/Git recursive clone imports, with customizable allow/deny/ask tool-execution permissions.
+- **Model Context Protocol (MCP) Servers (`/mcps`)** — Easily register, reload, toggle (enable/disable), and delete local stdio or remote SSE MCP server tools directly from Telegram.
 - **Robustness & Windows Stability** — Configured with automated API retries, suppressed verbose network noise, and Selector Event Loops for clean subprocess termination on Windows systems.
 
 ---
@@ -41,7 +43,7 @@ A premium, feature-rich Python bot that bridges your Telegram client directly to
 ### Option A: Standard PyPI Installation
 Install and run the bot wrapper directly from the terminal:
 ```bash
-pip install telegram-opencode-bridge-bot==0.1.15
+pip install telegram-opencode-bridge-bot==0.1.16
 telegram-opencode-bot
 ```
 > **💡 Tip:** Use the `--env` flag anytime to reconfigure your variables:
@@ -89,6 +91,8 @@ telegram-opencode-bot
 | **`/enable`** | — | Enables real-time streaming of tool calls, shell executions, and file edits. |
 | **`/disable`** | — | Disables streaming; the bot will only report the final LLM response. |
 | **`/share`** | — | Fetches a public, shareable web preview URL of the active conversation. |
+| **`/mcps`** | — | Lists registered Model Context Protocol (MCP) server statuses with interactive toggle and deletion controls. |
+| **`/skills`** | — | Lists configured agent skills with detailed instruction previews, copy blocks, permissions, direct file uploads, and URL imports. |
 ---
 
 ## ⚙️ Configuration Variables
@@ -159,7 +163,8 @@ telegram-opencode-bot/
 │   └── manager.py          # SQL persistence and state registry
 └── utils/
     ├── formatting.py       # Conversions, splits, and custom table layouts
-    └── security.py         # Rate-limiting, whitelist guards, and checks
+    ├── security.py         # Rate-limiting, whitelist guards, and checks
+    └── skill_manager.py    # Local/global skill parsing, URL/Git imports, and CRUD helpers
 ```
 
 ---

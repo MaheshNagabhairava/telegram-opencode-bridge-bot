@@ -542,3 +542,29 @@ class OpenCodeClient:
             logger.error(f"Failed to delete session {session_id} on server: {e}")
             raise
 
+    async def get_mcp_status(self) -> Any:
+        """Fetch status and connectivity details of registered MCP servers from the server."""
+        session = await self._get_session()
+        url = f"{self.server_url}/mcp"
+        headers = {"Accept": "application/json"}
+        try:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status >= 400:
+                    body = await resp.text()
+                    raise OpenCodeAPIError(resp.status, body)
+                
+                content_type = resp.headers.get("Content-Type", "")
+                if "json" in content_type:
+                    return await resp.json()
+                
+                text = await resp.text()
+                try:
+                    import json
+                    return json.loads(text)
+                except ValueError:
+                    return {}
+        except Exception as e:
+            logger.error(f"Failed to fetch MCP status from server: {e}")
+            raise
+
+

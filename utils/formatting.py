@@ -341,6 +341,7 @@ def format_status(
     opencode_available: bool,
     session_info: dict | None,
     model: str,
+    bot_version: str,
 ) -> str:
     """Format bot status for display."""
     oc_status = "🟢 Connected" if opencode_available else "🔴 Disconnected"
@@ -348,6 +349,7 @@ def format_status(
     lines = [
         "<b>📊 Bot Status</b>",
         "",
+        f"Bot Version: <code>v{bot_version}</code>",
         f"OpenCode Server: {oc_status}",
         f"Default Model: <code>{html.escape(model)}</code>",
     ]
